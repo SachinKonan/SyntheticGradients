@@ -1,0 +1,370 @@
+% references.bib -- Learning the Backward Pass for Test-Time Adaptation
+% Entries ending in "and others" have author lists truncated on purpose.
+
+% ---------- Meta-learning ----------
+
+@inproceedings{finn2017maml,
+  author    = {Finn, Chelsea and Abbeel, Pieter and Levine, Sergey},
+  title     = {Model-Agnostic Meta-Learning for Fast Adaptation of Deep Networks},
+  booktitle = {Proceedings of the 34th International Conference on Machine Learning},
+  year      = {2017}
+}
+
+@misc{nichol2018reptile,
+  author     = {Nichol, Alex and Achiam, Joshua and Schulman, John},
+  title      = {On First-Order Meta-Learning Algorithms},
+  year       = {2018},
+  eprint     = {1803.02999},
+  eprinttype = {arXiv}
+}
+
+@inproceedings{raghu2020anil,
+  author    = {Raghu, Aniruddh and Raghu, Maithra and Bengio, Samy and Vinyals, Oriol},
+  title     = {Rapid Learning or Feature Reuse? Towards Understanding the Effectiveness of {MAML}},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2020}
+}
+
+@inproceedings{chen2019closer,
+  author    = {Chen, Wei-Yu and Liu, Yen-Cheng and Kira, Zsolt and Wang, Yu-Chiang Frank and Huang, Jia-Bin},
+  title     = {A Closer Look at Few-shot Classification},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2019}
+}
+
+@inproceedings{tian2020rethinking,
+  author    = {Tian, Yonglong and Wang, Yue and Krishnan, Dilip and Tenenbaum, Joshua B. and Isola, Phillip},
+  title     = {Rethinking Few-Shot Image Classification: A Good Embedding Is All You Need?},
+  booktitle = {European Conference on Computer Vision},
+  year      = {2020}
+}
+
+@inproceedings{brown2020gpt3,
+  author    = {Brown, Tom B. and others},
+  title     = {Language Models are Few-Shot Learners},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2020}
+}
+
+@inproceedings{vonoswald2023icl,
+  author    = {von Oswald, Johannes and others},
+  title     = {Transformers Learn In-Context by Gradient Descent},
+  booktitle = {Proceedings of the 40th International Conference on Machine Learning},
+  year      = {2023}
+}
+
+% ---------- Synthetic gradients ----------
+
+@inproceedings{jaderberg2017dni,
+  author     = {Jaderberg, Max and Czarnecki, Wojciech Marian and Osindero, Simon and Vinyals, Oriol and Graves, Alex and Silver, David and Kavukcuoglu, Koray},
+  title      = {Decoupled Neural Interfaces using Synthetic Gradients},
+  booktitle  = {Proceedings of the 34th International Conference on Machine Learning},
+  year       = {2017},
+  eprint     = {1608.05343},
+  eprinttype = {arXiv}
+}
+
+@inproceedings{czarnecki2017understanding,
+  author     = {Czarnecki, Wojciech Marian and {\'S}wirszcz, Grzegorz and Jaderberg, Max and Osindero, Simon and Vinyals, Oriol and Kavukcuoglu, Koray},
+  title      = {Understanding Synthetic Gradients and Decoupled Neural Interfaces},
+  booktitle  = {Proceedings of the 34th International Conference on Machine Learning},
+  year       = {2017},
+  eprint     = {1703.00522},
+  eprinttype = {arXiv}
+}
+
+@misc{pemberton2024bplambda,
+  author     = {Pemberton, Joseph and Costa, Rui Ponte},
+  title      = {{BP}($\lambda$): Online Learning via Synthetic Gradients},
+  year       = {2024},
+  eprint     = {2401.07044},
+  eprinttype = {arXiv}
+}
+
+@misc{janfaza2023adagp,
+  author     = {Janfaza, Vahid and others},
+  title      = {{ADA-GP}: Accelerating {DNN} Training By Adaptive Gradient Prediction},
+  year       = {2023},
+  eprint     = {2305.13236},
+  eprinttype = {arXiv}
+}
+
+@misc{zhang2026backprop,
+  author     = {Zhang, Yibo Jacky and Tang, Zeyu and Koyejo, Sanmi},
+  title      = {Is Backpropagation Optimal? When Synthetic Gradients Improve Sample Efficiency},
+  year       = {2026},
+  eprint     = {2605.27946},
+  eprinttype = {arXiv}
+}
+
+% ---------- Feedback without weight transport, local losses ----------
+
+@article{lillicrap2016random,
+  author  = {Lillicrap, Timothy P. and Cownden, Daniel and Tweed, Douglas B. and Akerman, Colin J.},
+  title   = {Random Synaptic Feedback Weights Support Error Backpropagation for Deep Learning},
+  journal = {Nature Communications},
+  volume  = {7},
+  pages   = {13276},
+  year    = {2016}
+}
+
+@inproceedings{nokland2016dfa,
+  author     = {N{\o}kland, Arild},
+  title      = {Direct Feedback Alignment Provides Learning in Deep Neural Networks},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  year       = {2016},
+  eprint     = {1609.01596},
+  eprinttype = {arXiv}
+}
+
+@inproceedings{launay2020dfa,
+  author     = {Launay, Julien and Poli, Iacopo and Boniface, Fran{\c{c}}ois and Krzakala, Florent},
+  title      = {Direct Feedback Alignment Scales to Modern Deep Learning Tasks and Architectures},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  year       = {2020},
+  eprint     = {2006.12878},
+  eprinttype = {arXiv}
+}
+
+@inproceedings{akrout2019weighttransport,
+  author    = {Akrout, Mohamed and Wilson, Collin and Humphreys, Peter C. and Lillicrap, Timothy and Tweed, Douglas},
+  title     = {Deep Learning without Weight Transport},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2019}
+}
+
+@inproceedings{nokland2019local,
+  author    = {N{\o}kland, Arild and Eidnes, Lars Hiller},
+  title     = {Training Neural Networks with Local Error Signals},
+  booktitle = {Proceedings of the 36th International Conference on Machine Learning},
+  year      = {2019}
+}
+
+@inproceedings{belilovsky2020decoupled,
+  author    = {Belilovsky, Eugene and Eickenberg, Michael and Oyallon, Edouard},
+  title     = {Decoupled Greedy Learning of {CNNs}},
+  booktitle = {Proceedings of the 37th International Conference on Machine Learning},
+  year      = {2020}
+}
+
+% ---------- Learned update rules ----------
+
+@inproceedings{andrychowicz2016learning,
+  author     = {Andrychowicz, Marcin and Denil, Misha and G{\'o}mez, Sergio and Hoffman, Matthew W. and Pfau, David and Schaul, Tom and Shillingford, Brendan and de Freitas, Nando},
+  title      = {Learning to Learn by Gradient Descent by Gradient Descent},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  year       = {2016},
+  eprint     = {1606.04474},
+  eprinttype = {arXiv}
+}
+
+@inproceedings{metz2019metalearning,
+  author    = {Metz, Luke and Maheswaranathan, Niru and Cheung, Brian and Sohl-Dickstein, Jascha},
+  title     = {Meta-Learning Update Rules for Unsupervised Representation Learning},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2019}
+}
+
+@inproceedings{kirsch2021vsml,
+  author     = {Kirsch, Louis and Schmidhuber, J{\"u}rgen},
+  title      = {Meta Learning Backpropagation And Improving It},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  year       = {2021},
+  eprint     = {2012.14905},
+  eprinttype = {arXiv}
+}
+
+@inproceedings{lindsey2020flp,
+  author     = {Lindsey, Jack and Litwin-Kumar, Ashok},
+  title      = {Learning to Learn with Feedback and Local Plasticity},
+  booktitle  = {Advances in Neural Information Processing Systems},
+  year       = {2020},
+  eprint     = {2006.09549},
+  eprinttype = {arXiv}
+}
+
+@inproceedings{mitchell2022mend,
+  author    = {Mitchell, Eric and Lin, Charles and Bosselut, Antoine and Finn, Chelsea and Manning, Christopher D.},
+  title     = {Fast Model Editing at Scale},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2022}
+}
+
+@inproceedings{deng2025mgtta,
+  author     = {Deng, Qi and Niu, Shuaicheng and others},
+  title      = {Learning to Generate Gradients for Test-Time Adaptation via Test-Time Training Layers},
+  booktitle  = {Proceedings of the AAAI Conference on Artificial Intelligence},
+  year       = {2025},
+  eprint     = {2412.16901},
+  eprinttype = {arXiv}
+}
+
+% ---------- Test-time adaptation in vision ----------
+
+@inproceedings{sun2020ttt,
+  author    = {Sun, Yu and Wang, Xiaolong and Liu, Zhuang and Miller, John and Efros, Alexei A. and Hardt, Moritz},
+  title     = {Test-Time Training with Self-Supervision for Generalization under Distribution Shifts},
+  booktitle = {Proceedings of the 37th International Conference on Machine Learning},
+  year      = {2020}
+}
+
+@inproceedings{schneider2020covariate,
+  author    = {Schneider, Steffen and Rusak, Evgenia and Eck, Luisa and Bringmann, Oliver and Brendel, Wieland and Bethge, Matthias},
+  title     = {Improving Robustness against Common Corruptions by Covariate Shift Adaptation},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2020}
+}
+
+@inproceedings{wang2021tent,
+  author    = {Wang, Dequan and Shelhamer, Evan and Liu, Shaoteng and Olshausen, Bruno and Darrell, Trevor},
+  title     = {Tent: Fully Test-Time Adaptation by Entropy Minimization},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2021}
+}
+
+@inproceedings{niu2022eata,
+  author    = {Niu, Shuaicheng and Wu, Jiaxiang and Zhang, Yifan and Chen, Yaofo and Zheng, Shijian and Zhao, Peilin and Tan, Mingkui},
+  title     = {Efficient Test-Time Model Adaptation without Forgetting},
+  booktitle = {Proceedings of the 39th International Conference on Machine Learning},
+  year      = {2022}
+}
+
+@inproceedings{wang2022cotta,
+  author    = {Wang, Qin and Fink, Olga and Van Gool, Luc and Dai, Dengxin},
+  title     = {Continual Test-Time Domain Adaptation},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year      = {2022}
+}
+
+@inproceedings{niu2023sar,
+  author    = {Niu, Shuaicheng and Wu, Jiaxiang and Zhang, Yifan and Wen, Zhiquan and Chen, Yaofo and Zhao, Peilin and Tan, Mingkui},
+  title     = {Towards Stable Test-Time Adaptation in Dynamic Wild World},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2023}
+}
+
+@inproceedings{niu2024foa,
+  author    = {Niu, Shuaicheng and Miao, Chunyan and Chen, Guohao and Wu, Pengcheng and Zhao, Peilin},
+  title     = {Test-Time Model Adaptation with Only Forward Passes},
+  booktitle = {Proceedings of the 41st International Conference on Machine Learning},
+  year      = {2024}
+}
+
+% ---------- Test-time training for sequences ----------
+
+@inproceedings{krause2018dynamic,
+  author     = {Krause, Ben and Kahembwe, Emmanuel and Murray, Iain and Renals, Steve},
+  title      = {Dynamic Evaluation of Neural Sequence Models},
+  booktitle  = {Proceedings of the 35th International Conference on Machine Learning},
+  year       = {2018},
+  eprint     = {1709.07432},
+  eprinttype = {arXiv}
+}
+
+@misc{krause2019dynamic,
+  author     = {Krause, Ben and Kahembwe, Emmanuel and Murray, Iain and Renals, Steve},
+  title      = {Dynamic Evaluation of Transformer Language Models},
+  year       = {2019},
+  eprint     = {1904.08378},
+  eprinttype = {arXiv}
+}
+
+@misc{sun2024tttlayers,
+  author     = {Sun, Yu and Li, Xinhao and Dalal, Karan and Xu, Jiarui and Vikram, Arjun and Zhang, Genghan and Dubois, Yann and Chen, Xinlei and Wang, Xiaolong and Koyejo, Sanmi and Hashimoto, Tatsunori and Guestrin, Carlos},
+  title      = {Learning to (Learn at Test Time): {RNNs} with Expressive Hidden States},
+  year       = {2024},
+  eprint     = {2407.04620},
+  eprinttype = {arXiv}
+}
+
+@misc{zhang2025lact,
+  author     = {Zhang, Tianyuan and others},
+  title      = {Test-Time Training Done Right},
+  year       = {2025},
+  eprint     = {2505.23884},
+  eprinttype = {arXiv}
+}
+
+@misc{behrouz2025titans,
+  author     = {Behrouz, Ali and Zhong, Peilin and Mirrokni, Vahab},
+  title      = {Titans: Learning to Memorize at Test Time},
+  year       = {2025},
+  eprint     = {2501.00663},
+  eprinttype = {arXiv}
+}
+
+@misc{tandon2025ttte2e,
+  author     = {Tandon, Arnuv and Dalal, Karan and Li, Xinhao and Koceja, Daniel and R{\o}d, Marcel and Buchanan, Sam and Wang, Xiaolong and Leskovec, Jure and Koyejo, Sanmi and Hashimoto, Tatsunori and Guestrin, Carlos and McCaleb, Jed and Choi, Yejin and Sun, Yu},
+  title      = {End-to-End Test-Time Training for Long Context},
+  year       = {2025},
+  eprint     = {2512.23675},
+  eprinttype = {arXiv}
+}
+
+@online{nvidia2026ttt,
+  author       = {{NVIDIA}},
+  title        = {Reimagining {LLM} Memory: Using Context as Training Data Unlocks Models That Learn at Test-Time},
+  year         = {2026},
+  organization = {NVIDIA Developer Blog},
+  url          = {https://developer.nvidia.com/blog/reimagining-llm-memory-using-context-as-training-data-unlocks-models-that-learn-at-test-time/}
+}
+
+% ---------- Benchmarks and architectures ----------
+
+@inproceedings{hendrycks2019imagenetc,
+  author     = {Hendrycks, Dan and Dietterich, Thomas},
+  title      = {Benchmarking Neural Network Robustness to Common Corruptions and Perturbations},
+  booktitle  = {International Conference on Learning Representations},
+  year       = {2019},
+  eprint     = {1903.12261},
+  eprinttype = {arXiv}
+}
+
+@inproceedings{hendrycks2021imagenetr,
+  author    = {Hendrycks, Dan and others},
+  title     = {The Many Faces of Robustness: A Critical Analysis of Out-of-Distribution Generalization},
+  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  year      = {2021}
+}
+
+@inproceedings{wang2019sketch,
+  author    = {Wang, Haohan and Ge, Songwei and Lipton, Zachary C. and Xing, Eric P.},
+  title     = {Learning Robust Global Representations by Penalizing Local Predictive Power},
+  booktitle = {Advances in Neural Information Processing Systems},
+  year      = {2019}
+}
+
+@inproceedings{recht2019imagenetv2,
+  author    = {Recht, Benjamin and Roelofs, Rebecca and Schmidt, Ludwig and Shankar, Vaishaal},
+  title     = {Do {ImageNet} Classifiers Generalize to {ImageNet}?},
+  booktitle = {Proceedings of the 36th International Conference on Machine Learning},
+  year      = {2019}
+}
+
+@inproceedings{merity2017wikitext,
+  author    = {Merity, Stephen and Xiong, Caiming and Bradbury, James and Socher, Richard},
+  title     = {Pointer Sentinel Mixture Models},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2017}
+}
+
+@inproceedings{he2016resnet,
+  author    = {He, Kaiming and Zhang, Xiangyu and Ren, Shaoqing and Sun, Jian},
+  title     = {Deep Residual Learning for Image Recognition},
+  booktitle = {Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition},
+  year      = {2016}
+}
+
+@inproceedings{dosovitskiy2021vit,
+  author    = {Dosovitskiy, Alexey and others},
+  title     = {An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale},
+  booktitle = {International Conference on Learning Representations},
+  year      = {2021}
+}
+
+@inproceedings{liu2022convnext,
+  author    = {Liu, Zhuang and Mao, Hanzi and Wu, Chao-Yuan and Feichtenhofer, Christoph and Darrell, Trevor and Xie, Saining},
+  title     = {A {ConvNet} for the 2020s},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year      = {2022}
+}

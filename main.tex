@@ -1,0 +1,855 @@
+\documentclass{article}
+\usepackage[margin=1in]{geometry} % Sets 1 inch margins on all sides
+\usepackage{graphicx} % Required for inserting images
+\usepackage[american]{babel}
+\usepackage{csquotes}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[backend=biber, style=apa]{biblatex}
+\addbibresource{references.bib}
+\usepackage[hidelinks]{hyperref}
+
+\newcommand{\dhat}{\hat{d}}
+\newcommand{\deltahat}{\hat{\delta}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\title{Learning the Backward Pass for Test-Time Adaptation\\[4pt]
+\large Research Proposal and Literature Review}
+\author{Sachin Konan}
+\date{October 2026}
+
+\begin{document}
+
+\maketitle
+
+\noindent\emph{Status: proposal. No empirical results are claimed. Cost figures in
+Section~\ref{sec:cost} are our own operation-count estimates, not measurements.}
+
+% =====================================================================
+\section{Introduction}
+% =====================================================================
+
+Meta-learning had a clear arc. In 2017, MAML made learning-to-learn a matter of
+differentiating through gradient descent \parencite{finn2017maml}. By 2020, the
+few-shot benchmarks it was built for were matched by a pretrained embedding and
+a linear classifier \parencite{chen2019closer,tian2020rethinking,raghu2020anil},
+and few-shot learning itself was absorbed by in-context learning in large
+language models \parencite{brown2020gpt3}. The bi-level machinery faded.
+
+It has now returned in a different place. Test-time training updates a model's
+weights on the test stream itself, and TTT-E2E \parencite{tandon2025ttte2e}
+shows that a language model whose initialization is meta-learned for test-time
+gradient steps scales with context length like full attention, at constant cost
+per token, with 3B-parameter models. The inner loop is no longer a few steps on
+a toy task. It is the model's memory.
+
+This puts weight on one component: the backward pass. Every gradient-based
+test-time method runs one at inference. Tent \parencite{wang2021tent}
+backpropagates through an entire ResNet-50 to update its normalization
+parameters, under 1\% of the model. TTT-E2E restricts its inner loop to the
+last quarter of its blocks, trading stored context against the cost of
+backpropagating further, and its outer loop differentiates through that
+backward pass, which makes training 3.4$\times$ slower than standard
+pre-training at 8K context \parencite{nvidia2026ttt}. The backward pass decides how much of a network can
+adapt and how expensive it is to train the adaptation. We ask:
+
+\begin{center}
+\emph{How much of the backward pass does test-time adaptation need?}
+\end{center}
+
+We propose to keep the part that is cheap and exact, and to learn the rest. The
+error at the output is available in closed form. From there, a small recurrent
+network runs down the depth of the model, reads the activations saved in the
+forward pass, and predicts the error signal at each adapted layer for every
+token. Weight updates are formed from these signals exactly as in
+backpropagation, as sums of outer products $\deltahat x^\top$. The predictor is
+first trained to imitate true gradients and then trained through the loss on
+later data. None of these ingredients is new: synthetic gradients, direct
+feedback, and learned update rules have each been studied separately
+(Section~\ref{sec:related}). They have not been combined in the setting where
+they fit best, a pretrained checkpoint adapting online to a stream.
+
+A simple cost model (Section~\ref{sec:cost}) says what to expect. The predictor
+removes only the error-propagation part of the backward pass. The ceiling on
+the speedup is therefore about 1.2$\times$ when a few top layers adapt,
+1.5--1.75$\times$ when all layers adapt, and about 2$\times$ when only
+normalization parameters adapt, as in Tent. This is why ImageNet-C is our main
+benchmark, why our headline measurement is a quality--cost frontier and not a
+single speedup number, and why we treat the first-order outer loop as a claim
+of its own. We hope the experiments clarify which parts of backpropagation
+adaptation actually depends on, whichever way they come out.
+
+% =====================================================================
+\section{Background and Related Work}
+\label{sec:related}
+% =====================================================================
+
+We organize prior work around three questions: where the hidden-layer error
+signal comes from, whether a backward pass runs at test time, and whether the
+update rule is itself trained. Table~\ref{tab:positioning} summarizes the
+answers.
+
+% ---------------------------------------------------------------------
+\subsection{Meta-Learning: From Few-Shot Benchmarks to Test-Time Training}
+
+\subsubsection{MAML}
+
+MAML \parencite{finn2017maml} learns an initialization from which one or a few
+gradient steps on a new task's small training set give low loss on that task's
+held-out examples. The outer gradient is taken through the inner gradient
+steps, so it contains second derivatives of the inner loss. The paper evaluates
+on few-shot classification (Omniglot, miniImageNet), sinusoid regression, and
+simulated locomotion, and already reports that a first-order approximation
+performs almost as well on miniImageNet. Our outer objective has the same form,
+a loss measured after adaptation, but the persistent quantity we optimize is
+the feedback rule and not the initialization.
+
+\subsubsection{First-Order Variants and Feature Reuse}
+
+Reptile \parencite{nichol2018reptile} removes second derivatives entirely: it
+runs SGD on a sampled task and moves the initialization toward the resulting
+weights. ANIL \parencite{raghu2020anil} then asks what MAML's inner loop is
+doing. It finds that the inner loop barely changes the representations in the
+network body, and that restricting adaptation to the head matches MAML. In
+parallel, \textcite{chen2019closer} and \textcite{tian2020rethinking} show that
+standard pre-training followed by a linear classifier matches or exceeds
+meta-learners on the same benchmarks. Together these results explain why the
+field moved on: on narrow task distributions a good representation was
+sufficient, and the inner loop was not doing the work. We take this as a design
+rule. Every claim in this proposal is paired with a simple baseline that could
+make the learned component redundant (Section~\ref{sec:baselines}).
+
+\subsubsection{In-Context Learning}
+
+GPT-3 \parencite{brown2020gpt3} showed few-shot learning emerging from
+next-token prediction at scale, with no weight updates.
+\textcite{vonoswald2023icl} connect this back to optimization: a linear
+self-attention layer can implement a step of gradient descent on a regression
+loss in its forward pass. On this view in-context learning and explicit inner
+loops belong to one family. The choice between them is about where the adapted
+state lives, in activations or in weights, and what it costs to update.
+
+% ---------------------------------------------------------------------
+\subsection{Synthetic Gradients}
+
+\subsubsection{Decoupled Neural Interfaces}
+
+DNI \parencite{jaderberg2017dni} attaches a small model to a layer's output $h$
+that predicts $\partial L/\partial h$, so that the layers below can update
+without waiting for the rest of the network. The predictor is trained by
+regression onto the gradient that later arrives from above, which may itself be
+a synthetic gradient from the next module. On feed-forward networks (MNIST,
+CIFAR-10) training succeeds with some loss of accuracy, part of which is
+recovered when the predictor is conditioned on the label. In recurrent
+networks, synthetic gradients extend the effective horizon of truncated
+backpropagation through time. DNI is the direct ancestor of our imitation
+phase. Two differences matter. DNI aims to remove update locking, not to reduce
+computation: each module still backpropagates locally. And its predictor chases
+a network trained from scratch, whereas ours is fit around a fixed pretrained
+checkpoint.
+
+\subsubsection{Analysis of Synthetic Gradients}
+
+\textcite{czarnecki2017understanding} study what synthetic gradients do to
+optimization. They prove convergence for linear and deep linear models, show
+empirically that the learned layer-wise representations differ from those of
+backpropagation, and place feedback alignment and direct feedback alignment in
+the same framework as special cases with fixed predictors. These results
+motivate our correctness checks on linear models. They do not cover a
+nonlinear, recurrent predictor trained through an outer loss.
+
+\subsubsection{BP($\lambda$)}
+
+\textcite{pemberton2024bplambda} train synthetic-gradient models fully online
+in recurrent networks, using eligibility traces in the manner of TD($\lambda$)
+so that producing targets needs no backpropagation through time. The work makes
+the bias of bootstrapped targets explicit. It concerns credit assignment over
+time; ours is over depth.
+
+\subsubsection{Adaptive Gradient Prediction}
+
+ADA-GP \parencite{janfaza2023adagp} alternates between phases that run true
+backpropagation while training a gradient predictor and phases that skip
+backpropagation and use predicted gradients, with phase lengths chosen
+adaptively. The authors note that predicting all the time would remove the
+backward pass entirely but degrades accuracy. This is prior art for a hybrid
+variant of our method with periodic exact refreshes, and it suggests the
+matched control: exact updates at the same reduced frequency.
+
+\subsubsection{When Synthetic Gradients Beat Backpropagation}
+
+\textcite{zhang2026backprop} view backpropagation as a Monte Carlo estimator of
+the expected gradient and synthetic gradients as a bootstrapped one, and
+characterize when the latter has lower mean squared error: some source of
+randomness in the feedback, or structural sparsity, is required. Experiments
+are on contextual bandits and reinforcement learning. The paper also notes that
+when exact backpropagation is available, prior work finds synthetic gradients
+do not match it without additional mechanisms. The implication for us is
+narrow. A predicted signal can beat the minibatch gradient only as an estimate
+of the \emph{expected} gradient, which matters on noisy streams and not for a
+fixed observed batch.
+
+\subsubsection{A Recent Negative Result}
+
+A 2026 preprint (arXiv:2608.21386) reports in an appendix that per-layer
+gradient predictors in a Transformer became redundant once local auxiliary
+losses were present, and that the cosine similarity between predicted and true
+gradients fell from about 0.99 at initialization to 0.2--0.5 near convergence.
+We have read only an excerpt of this work. If the decay also holds around a
+converged checkpoint under distribution shift, our first claim fails, so we
+measure it before building anything else (Section~\ref{sec:gates}).
+
+% ---------------------------------------------------------------------
+\subsection{Feedback Without Weight Transport}
+
+\subsubsection{Feedback Alignment}
+
+\textcite{lillicrap2016random} replace the transposed forward weights in the
+backward pass with fixed random matrices. Learning still works, because the
+forward weights come to align with the feedback weights. The result established
+that useful error signals do not require the exact transpose.
+
+\subsubsection{Direct Feedback Alignment}
+
+DFA \parencite{nokland2016dfa} goes further and sends the output error to every
+hidden layer through its own fixed random projection, with no layer-to-layer
+backward pass at all. \textcite{launay2020dfa} show that DFA trains modern
+architectures in neural view synthesis, recommender systems, graph learning,
+and language modeling with performance close to backpropagation; convolutional
+networks remain a known difficult case. DFA is the essential cheap competitor.
+It has access to the same output error as our method and costs one projection
+per layer. Our predictor must beat it in both a fixed-random and a
+regression-fit form.
+
+\subsubsection{Learned Feedback Weights}
+
+\textcite{akrout2019weighttransport} learn the feedback weights instead of
+fixing them, with rules that drive them toward the transposes of the forward
+weights, and reach accuracy close to backpropagation on ImageNet with ResNet-18
+and ResNet-50. Learned feedback can therefore work at ImageNet scale, although
+here the backward pass costs as much as backpropagation.
+
+\subsubsection{Local Losses}
+
+A different way to avoid deep backward passes is to give each layer or block
+its own loss. \textcite{nokland2019local} and \textcite{belilovsky2020decoupled}
+train deep convolutional networks with local auxiliary objectives and approach
+end-to-end accuracy. Local losses are the main alternative to predicted
+gradients, and the test-time-training literature has its own version
+(Section~\ref{sec:tttseq}).
+
+% ---------------------------------------------------------------------
+\subsection{Learned Update Rules}
+
+\subsubsection{Learned Optimizers}
+
+\textcite{andrychowicz2016learning} train an LSTM that maps each coordinate's
+gradient history to an update, by backpropagating through unrolled
+optimization. To keep this tractable they ignore the dependence of the
+optimizee's gradients on the optimizer's parameters, which drops the
+second-derivative terms. The recurrence over optimization steps is the
+precedent for memory across batches. The optimizer consumes true gradients, so
+it says nothing about skipping the backward pass.
+
+\subsubsection{Meta-Learned Update Rules}
+
+\textcite{metz2019metalearning} meta-learn a local update rule for unsupervised
+representation learning. The rule includes its own learned backward weights,
+untied from the forward weights, and the meta-objective is few-shot
+classification from the learned features. The rule transfers across
+architectures and datasets. It is an early instance of learning the feedback
+pathway through an outer objective.
+
+\subsubsection{Variable Shared Meta Learning}
+
+\textcite{kirsch2021vsml} replace each weight with a tiny recurrent network
+whose parameters are shared across the whole model, with messages passing
+forward and backward. Such a system can implement backpropagation in its
+forward dynamics, and it can be meta-trained into learning algorithms that
+differ from backpropagation. It is the closest conceptual precedent for a
+learned backward algorithm. It does not address cost.
+
+\subsubsection{Feedback and Local Plasticity}
+
+\textcite{lindsey2020flp} meta-learn feedback weights, the forward
+initialization, and plasticity rates so that a network learns online with local
+Hebbian updates and no gradient computation in the inner loop. The meta-trained
+networks match or exceed a gradient-based online meta-learning baseline on
+regression and classification, with the largest gains in continual learning.
+This is the closest prior work to our outer-loop phase: feedback trained
+through the performance of the adapted network. The differences are scale and
+setting. Their networks are small and start from a meta-learned initialization
+on few-shot tasks. Ours are pretrained ImageNet-scale models adapting to a
+stream, with the exact shortcut path retained and gradient imitation as the
+starting point.
+
+\subsubsection{MEND}
+
+MEND \parencite{mitchell2022mend} edits large language models by transforming
+fine-tuning gradients with small learned networks. It relies on the same
+identity as our method: for a linear layer the gradient on one example is the
+rank-one product $\delta x^\top$, so the editor networks act on $\delta$ and
+$x$ and never on the full weight matrix. MEND takes the true $\delta$ from a
+backward pass and learns to transform it. We predict $\delta$.
+
+\subsubsection{Learned Gradient Generation for Adaptation}
+
+MGTTA \parencite{deng2025mgtta} learns an optimizer for test-time adaptation
+that stores historical gradient information in a memory layer and refines the
+update. It is the nearest history-based method in our target setting. It
+consumes gradients computed by backpropagation, so it is a quality baseline and
+not a cost baseline. It is also the template for a control this proposal needs:
+a learned rule fed with exact signals.
+
+% ---------------------------------------------------------------------
+\subsection{Test-Time Adaptation in Vision}
+
+\subsubsection{Test-Time Training}
+
+\textcite{sun2020ttt} train a network with a shared encoder, a classification
+head, and a self-supervised head that predicts image rotation. At test time the
+encoder is updated on the self-supervised loss of the incoming sample, either
+independently per sample or online over a stream. This improves robustness on
+CIFAR-10-C and ImageNet-C and defines the label-free setting.
+
+\subsubsection{Normalization Statistics}
+
+\textcite{schneider2020covariate} show that re-estimating batch normalization
+statistics on test data removes a large part of the corruption error on
+ImageNet-C with no gradient step. It is the forward-only baseline that any
+backward-free method must beat.
+
+\subsubsection{Tent}
+
+Tent \parencite{wang2021tent} needs no change to training. It minimizes the
+entropy of the model's predictions on each test batch and updates only the
+affine parameters of the normalization layers, with normalization statistics
+taken from the batch. Few parameters change, but the gradient with respect to
+an early normalization layer requires a backward pass through nearly the whole
+network. Tent is our primary exact baseline, and its structure is why the cost
+ceiling of our method is highest here (Section~\ref{sec:cost}).
+
+\subsubsection{EATA}
+
+EATA \parencite{niu2022eata} adds two things to entropy minimization. It adapts
+only on samples that are reliable and non-redundant, which reduces the number
+of backward passes, and it regularizes important weights to limit forgetting.
+It is a cost baseline of a different kind: fewer exact backward passes, not
+cheaper ones.
+
+\subsubsection{CoTTA}
+
+CoTTA \parencite{wang2022cotta} defines continual test-time adaptation, where
+the target distribution changes over a long stream with no reset. It uses a
+weight-averaged teacher, augmentation-averaged pseudo-labels, and stochastic
+restoration of weights to the source model. Its protocol on CIFAR-10-C,
+CIFAR-100-C, and ImageNet-C is our long-horizon stability test.
+
+\subsubsection{SAR}
+
+\textcite{niu2023sar} study adaptation under mixed shifts, small batches, and
+label shift. Batch-normalized models are unstable in these conditions; group-
+and layer-normalized models are more stable but can still collapse. The remedy
+is to filter high-entropy samples and to minimize entropy with a
+sharpness-aware step. This matters for us because a rule trained on future loss
+could learn such caution, or could inherit the collapse.
+
+\subsubsection{Forward-Only Adaptation}
+
+FOA \parencite{niu2024foa} adapts a vision Transformer without any backward
+pass. It learns an input prompt by derivative-free optimization, with a fitness
+that combines prediction entropy and activation statistics, and it shifts the
+final-layer activations. It runs on quantized models, where backpropagation is
+unavailable. FOA shows there is demand for backward-free adaptation and is the
+closest competitor on that axis. It pays with several forward passes per batch.
+
+% ---------------------------------------------------------------------
+\subsection{Test-Time Training for Sequences}
+\label{sec:tttseq}
+
+\subsubsection{Dynamic Evaluation}
+
+\textcite{krause2018dynamic} adapt a language model's weights to the recent
+history of the test sequence by gradient descent during evaluation, with a
+decay back toward the trained weights, and improve perplexity on standard
+benchmarks; \textcite{krause2019dynamic} extend this to Transformers. The model
+is not trained for the adaptation it will undergo. Dynamic evaluation is the
+language analog of Tent and our bridge benchmark.
+
+\subsubsection{TTT Layers}
+
+\textcite{sun2024tttlayers} make the hidden state of a sequence layer the
+weights of a small inner model. The inner model is updated per token by a
+gradient step on a self-supervised reconstruction loss whose inputs and targets
+are learned in the outer loop. Because the loss is local to the layer, the
+inner gradient needs no backward pass through depth. Later work scales the idea
+with large-chunk updates \parencite{zhang2025lact} and adds momentum and
+forgetting to the inner update \parencite{behrouz2025titans}.
+
+\subsubsection{TTT-E2E}
+
+TTT-E2E \parencite{tandon2025ttte2e} replaces the layer-wise loss with the
+next-token loss at the end of the network, and meta-learns the initialization
+so that the loss \emph{after} test-time updates is low. The architecture is a
+standard Transformer with sliding-window attention over 8K tokens. The inner
+loop takes one step per 1K tokens and updates only the MLPs in the last quarter
+of the blocks. With 3B-parameter models it scales with context length in the
+same way as full attention, with inference 2.7$\times$ faster than full
+attention at 128K context.
+
+Three of its findings set up this proposal. First, the end-to-end signal is
+better than the local one: at 760M parameters and 8K context, the loss falls
+from 2.819 to 2.806 when the layer-wise loss is replaced by the next-token
+loss. Second,
+the cost of preparing upstream gradients shapes the design: the authors update
+fewer, larger layers because backpropagating to many small ones is expensive.
+Third, the outer loop needs gradients of gradients, and the reported training
+cost is 3.4$\times$ that of standard pre-training at 8K context, attributed to
+missing second-order support in the attention kernel
+\parencite{nvidia2026ttt}. Our method targets the space between the first
+finding and the other two: an end-to-end error signal at close to local cost,
+with a first-order outer loop.
+
+\subsubsection{Costate Prediction}
+
+A concurrent preprint, GradLev (arXiv:2609.34174), predicts backward signals
+during training so that token-level test-time training can be trained in
+parallel, and discards the predictor at test time, where exact per-token
+gradients are used. It is the mirror image of this proposal, which uses exact
+gradients as training targets and predicted ones at test time. We have read
+only an excerpt.
+
+% ---------------------------------------------------------------------
+\subsection{Positioning}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{L{3.0cm} L{4.4cm} L{3.6cm} L{3.4cm}}
+\toprule
+Method & Hidden-layer signal & Backward pass at test time & Learned rule \\
+\midrule
+Tent & exact, entropy loss & full network & no \\
+EATA & exact, entropy loss & full, on selected samples & no \\
+FOA & none (derivative-free) & none & no \\
+DNI & predicted, bootstrapped & within each module & predictor only \\
+DFA & fixed random projection of output error & none & no \\
+FLP & meta-learned feedback & none & yes \\
+MGTTA & exact, then transformed & full network & yes \\
+TTT layers & exact, local loss & one layer & outer loop \\
+TTT-E2E & exact, end loss & last quarter of blocks & yes, second-order \\
+\midrule
+This proposal & predicted from the exact output error & none beyond the output seed & yes, first-order \\
+\bottomrule
+\end{tabular}
+\caption{Where each method gets its hidden-layer error signal and what it pays
+for it. The proposal occupies the empty cell: an end-loss signal with no
+backward pass through depth, trained through its effect on later data.}
+\label{tab:positioning}
+\end{table}
+
+% =====================================================================
+\section{Proposed Method}
+\label{sec:method}
+% =====================================================================
+
+\subsection{Setting}
+
+A pretrained network processes a stream of batches $C_1, C_2, \dots$ A chosen
+subset $W$ of its parameters, the fast weights, is updated online; everything
+else stays at the checkpoint. Each batch is scored with the current weights
+\emph{before} it is used for an update. The predictor's parameters $\phi$ are
+fixed at deployment. We train one predictor per checkpoint and architecture;
+transfer across checkpoints is a separate question.
+
+\subsection{Local Gradient Identities}
+
+Let $n$ index examples and positions (tokens or spatial locations). For a
+linear map $z = Wx$ with error signal $\delta = \partial L/\partial z$,
+\begin{equation}
+\nabla_W L = \sum_n \delta_n x_n^\top .
+\label{eq:linear}
+\end{equation}
+For a normalization layer $y = \gamma \odot \tilde{x} + \beta$ with
+$\delta = \partial L/\partial y$ and normalized input $\tilde{x}$,
+\begin{equation}
+\nabla_\gamma L = \sum_n \delta_n \odot \tilde{x}_n, \qquad
+\nabla_\beta L = \sum_n \delta_n .
+\label{eq:norm}
+\end{equation}
+Convolutions follow \eqref{eq:linear} with input patches in place of $x$. In
+both cases the forward quantity is already in memory, and the only missing
+quantity is $\delta$. The method predicts $\delta$ for every token and leaves
+\eqref{eq:linear}--\eqref{eq:norm} untouched. It does not predict weight
+matrices or low-rank factors. Per-token signals keep the procedure identical to
+backpropagation with one term replaced, which is what makes the comparison with
+exact adaptation clean.
+
+\subsection{The Exact Seed}
+
+The error at the logits $z$ is available in closed form for each setting we
+study. With softmax output $p$, $n$ scored predictions, and entropy
+$H = -\sum_k p_k \log p_k$:
+\begin{align}
+\text{labels revealed (cross-entropy):} \quad &
+  \partial L/\partial z = (p - y)/n, \\
+\text{label-free (entropy, as in Tent):} \quad &
+  \partial H/\partial z_j = -\,p_j\,(\log p_j + H), \\
+\text{language modeling:} \quad &
+  \text{cross-entropy against the observed next token.}
+\end{align}
+The seed is propagated exactly through the frozen head and any final pooling or
+normalization, giving the error $d_{L+1}$ at the top of the residual stream.
+This is the only true gradient the deployed method uses.
+
+\subsection{A Recurrence over Depth}
+
+Write block $l$ as $h_{l+1} = \sigma_l\!\left(P_l h_l + F_l(h_l)\right)$, where
+$P_l$ is the shortcut (identity or projection), $F_l$ the residual branch, and
+$\sigma_l$ the identity for pre-activation and pre-norm designs or a ReLU for
+post-activation ResNets. With $d_l = \partial L/\partial h_l$ and $m_l$ the
+derivative of $\sigma_l$ at its input, backpropagation gives
+\begin{equation}
+d_l = P_l^\top (m_l \odot d_{l+1}) + J_{F_l}^\top (m_l \odot d_{l+1}).
+\label{eq:exact}
+\end{equation}
+The first term is cheap and exact. We keep it and replace the second with a
+low-rank learned correction driven by a small state $s_l \in \mathbb{R}^r$ per
+position:
+\begin{align}
+s_{L+1} &= E^\top d_{L+1}, \qquad \dhat_{L+1} = d_{L+1}, \\
+s_l &= s_{l+1} + B\left(\varphi\!\left(C_l^\top a_l + e_l\right) \odot A\, s_{l+1}\right),
+\label{eq:cell} \\
+\dhat_l &= P_l^\top (m_l \odot \dhat_{l+1}) + U_l\, s_l .
+\label{eq:pred}
+\end{align}
+Here $a_l$ is a forward activation of block $l$ that is already saved (the
+input to the adapted layer), $e_l$ is a learned layer embedding, $\varphi$ is a
+pointwise nonlinearity, $A$ and $B$ are $r \times r$ matrices shared across
+depth, and $C_l$, $U_l$, $E$ project between the model width and $r$. The cell
+is multiplicative by design: the true term in \eqref{eq:exact} is linear in the
+incoming error and gated by the forward activations, and \eqref{eq:cell} has
+the same form. $U_l$ is initialized to zero, so the rule starts as
+\emph{shortcut-only} feedback, a transparent baseline.
+
+\paragraph{Taps.} An adapted parameter needs the error at its own output. For a
+layer that writes directly into the residual sum (the last normalization layer
+of a ResNet bottleneck, or the output projection of a Transformer MLP), that
+error is $m_l \odot \dhat_{l+1}$ and comes for free from \eqref{eq:pred}. For a
+parameter inside a branch (other normalization layers; LayerNorm at the input
+of a Transformer sublayer) we add a linear head $\deltahat = V s_l$. The first
+experiments use only the first kind.
+
+\paragraph{Mixing across positions.} Equations
+\eqref{eq:cell}--\eqref{eq:pred} treat positions independently, which makes
+them a batch dimension. The true error is not independent across positions: in
+a causal Transformer, position $t$ receives error from the losses at later
+positions that attend to it, and in a ConvNet from neighboring locations. We
+add a cheap mixing step on $s$, a depthwise $3\times 3$ convolution for
+ConvNets and an anti-causal depthwise 1-D convolution for sequences. The
+position-independent predictor is an ablation.
+
+\paragraph{Parallelism.} Positions are processed in parallel. The recurrence is
+sequential over $L$ blocks, each step a pair of small matrix products. Updates
+are applied once per chunk (a batch of images, or a mini-batch of tokens as in
+TTT-E2E), since updating after every token would make the forward pass itself
+serial. The sums in \eqref{eq:linear}--\eqref{eq:norm} are batched matrix
+products. In JAX: \texttt{einsum} for the updates, \texttt{lax.scan} over
+depth, and \texttt{vmap} over sequences when each sequence carries its own fast
+weights.
+
+\subsection{Training the Predictor}
+
+\paragraph{Phase A: imitation.} Run exact adaptation episodes on training
+streams and record the true error at every tap before each update. Train
+$\phi$ to regress these targets with a per-layer normalized squared error,
+feeding the exact incoming error at first. Report direction and magnitude
+separately; cosine alone does not calibrate a step.
+
+\paragraph{Phase B: self-generated states.} Roll the recurrence out from the
+seed with its own predictions as inputs, and let the predicted updates move the
+working weights. Recompute true targets on the states the predictor actually
+reaches. This corrects two mismatches: error compounding down the depth, and
+drift of the weights over a stream.
+
+\paragraph{Phase C: future loss.} Unroll $K$ updates and train $\phi$ on the
+loss of later batches:
+\begin{equation}
+J(\phi) = \mathbb{E}\Big[\sum_{t=1}^{K} \ell\big(C_t; W_t\big)\Big],
+\qquad W_{t+1} = W_t - \eta\, g_\phi(W_t, C_t),
+\end{equation}
+where $g_\phi$ denotes the predicted update and each $C_t$ is scored before
+$W_t$ is updated on it. Two properties are worth stating. First, $\ell$ can be
+the supervised loss even when the seed is label-free: labels are available on
+the predictor's training streams, so an entropy-driven rule can be trained to
+reduce true error on later data. Second, the outer gradient is first-order.
+$g_\phi$ is a composition of a forward pass, a closed-form seed, the recurrence
+\eqref{eq:cell}--\eqref{eq:pred}, and the sums
+\eqref{eq:linear}--\eqref{eq:norm}. It contains no call to reverse-mode
+differentiation, so $\nabla_\phi J$ is one ordinary reverse pass through the
+unroll. With an exact inner gradient the same objective requires
+reverse-over-reverse. We start at $K=2$, keep an imitation term with a decaying
+weight, and always compare three variants: imitation only, outer training from
+random initialization, and imitation followed by outer training.
+
+\subsection{Cost Model}
+\label{sec:cost}
+
+Let $F$ be the cost of the forward pass, $V$ the cost of propagating the error
+through the adapted depth (the vector--Jacobian products), and $G$ the cost of
+forming parameter gradients from $\delta$ via
+\eqref{eq:linear}--\eqref{eq:norm}. Exact adaptation costs $F + V + G$. The
+learned rule costs $F + G + \Pi$, where $\Pi$ is the predictor. It removes $V$
+and nothing else. For a linear or convolutional layer, each of the three costs
+is about one forward-equivalent of that layer, because the sum over tokens in
+\eqref{eq:linear} is a matrix product of the same size as the forward one. All
+terms scale linearly with batch size and sequence length, so the ratio does not
+improve with scale.
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{L{7.6cm} c c c c}
+\toprule
+Configuration & $F$ & $V$ & $G$ & Ceiling $\frac{F+V+G}{F+G}$ \\
+\midrule
+ResNet, 9 two-conv blocks; final conv of top 3 blocks & 18.2 & 4 & 3 & 1.19$\times$ \\
+Same network; final conv of all 9 blocks & 18.2 & 16 & 9 & 1.59$\times$ \\
+Transformer; MLP output projection, last quarter of blocks & 3 & 0.75 & 0.25 & 1.23$\times$ \\
+Transformer; MLP output projection, all blocks & 3 & 3 & 1 & 1.75$\times$ \\
+Any network; normalization parameters only, all layers & 1 & $\approx 1$ & $\approx 0$ & $\approx 2\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Speedup ceilings with a free predictor ($\Pi = 0$). ResNet rows are in
+units of one $3\times 3$ convolution; Transformer rows are in units of one MLP
+matrix product per block, with attention projections counted as one unit and
+attention-score computation ignored. These are operation counts, not wall-clock
+measurements. The ceiling is highest when the parameter gradient is cheap.}
+\label{tab:cost}
+\end{table}
+
+Three consequences follow from Table~\ref{tab:cost}. Adapting only a few top
+layers leaves almost nothing to save. Adapting normalization parameters, where
+$G \approx 0$, is the most favorable case, which is the Tent setting. And the
+exact baseline can choose its depth too: by this count, predicted signals on
+all Transformer blocks cost the same as exact signals on the last quarter. The
+honest comparison is therefore a frontier, quality against cost at several
+adapted depths for both methods, not a single ratio. The predictor itself is
+small: at $r = d/16$ and a $4\times$ MLP, one step of
+\eqref{eq:cell}--\eqref{eq:pred} costs about $0.3\,d^2$ per token, under 3\% of
+the roughly $12\,d^2$ vector--Jacobian product of a Transformer block. A
+full-width recurrent cell would cost more than the pass it replaces.
+
+% =====================================================================
+\section{Experimental Plan}
+\label{sec:experiments}
+% =====================================================================
+
+\subsection{Benchmarks}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{L{3.9cm} L{3.5cm} L{2.0cm} L{5.2cm}}
+\toprule
+Benchmark & Models & Seed & Role \\
+\midrule
+CIFAR-10-C, CIFAR-100-C \parencite{hendrycks2019imagenetc}
+  & standard public checkpoints & entropy & development loop; all ablations run here first \\
+ImageNet-C, 15 corruptions, severity 5
+  & ResNet-50, ViT-B/16, ConvNeXt \parencite{he2016resnet,dosovitskiy2021vit,liu2022convnext}
+  & entropy & main result; quality--cost frontier \\
+Continual ImageNet-C \parencite{wang2022cotta}
+  & same & entropy & long streams with no reset; stability \\
+ImageNet-R, ImageNet-Sketch, ImageNetV2
+  \parencite{hendrycks2021imagenetr,wang2019sketch,recht2019imagenetv2}
+  & same & entropy & shifts never seen by the predictor \\
+WikiText-103 \parencite{merity2017wikitext}, enwik8
+  & small Transformer & next token & dynamic evaluation; bridge to language \\
+Long-context language modeling
+  & small Transformer with sliding-window attention & next token
+  & TTT-E2E-style comparison; outer-loop cost \\
+\bottomrule
+\end{tabular}
+\caption{Benchmarks. Each uses a pretrained checkpoint, an online stream, and
+an exact seed at the output.}
+\label{tab:benchmarks}
+\end{table}
+
+Training ImageNet from scratch with predicted gradients is out of scope. The
+predictor would have to track weights that move far from any checkpoint, which
+is the original synthetic-gradient problem, and the outer objective cannot be
+unrolled through a full training run. Reinforcement learning is also out of
+scope: policy networks are small, so the cost argument does not apply, and the
+relevant claim there is about gradient noise \parencite{zhang2026backprop}.
+
+\subsection{Predictor Training Data}
+
+The predictor is a trained component, so the data that trains it is training
+data for the whole system. Two rules follow.
+
+\emph{No test corruption in training.} ImageNet-C defines 15 test corruption
+types and four additional held-out types (speckle noise, Gaussian blur,
+spatter, saturate) intended for validation
+\parencite{hendrycks2019imagenetc}. Predictor training streams use the four
+held-out types plus generic photometric and geometric shifts, applied to
+training images. None of the 15 test types appears at any severity. Stream
+order, shift schedule, and all hyperparameters are fixed before the test
+streams are run.
+
+\emph{Check the backbone-seen confound.} Public ImageNet checkpoints were
+trained on the full training set, so the predictor's training images have been
+seen by the backbone, and their error statistics may differ from those of test
+images. On CIFAR we control this directly, by retraining the backbone with a
+held-out split and comparing predictors trained on seen and unseen images. If
+the difference matters, the ImageNet experiments split the validation set by
+image and report on the held-out half, flagged as non-standard.
+
+\subsection{Baselines and Controls}
+\label{sec:baselines}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{L{5.6cm} L{9.4cm}}
+\toprule
+Method & What it controls for \\
+\midrule
+No adaptation & whether adaptation helps at all \\
+Normalization statistics only \parencite{schneider2020covariate} & what a single forward pass already buys \\
+Tent, all normalization parameters & the standard exact method \\
+Tent, restricted to our taps & exact signals at the same adapted parameters \\
+EATA, SAR & exact methods with sample selection and stability mechanisms \\
+FOA & backward-free adaptation by other means \\
+Shortcut-only feedback ($U_l = 0$) & what the exact identity path gives without learning \\
+DFA, fixed random and regression-fit & whether a recurrence beats one projection per layer \\
+Imitation only (Phases A--B) & whether training on future loss adds anything \\
+Outer training from random initialization & whether imitation is a useful starting point \\
+\textbf{Learned rule on exact signals} & separates the signal source from the learned update rule \\
+Exact adaptation at depth $\tfrac18, \tfrac14, \tfrac12, 1$ & the exact quality--cost frontier \\
+Exact updates at matched reduced frequency & whether predicting between exact steps beats skipping them \\
+Local-loss TTT layer (language) & the existing cheap alternative to a deep backward pass \\
+\bottomrule
+\end{tabular}
+\caption{Baselines. The row in bold is the control missing from most learned-feedback
+work: Phase~C changes both the signal and the rule, and without this row a
+gain cannot be attributed.}
+\label{tab:baselines}
+\end{table}
+
+\subsection{Measurements and Decision Gates}
+\label{sec:gates}
+
+We measure three things separately. \emph{Signal quality}: per-layer cosine and
+norm ratio against the true error, as a function of depth, on states the
+predictor reaches by itself, and the same for the induced parameter gradient.
+\emph{Adaptation quality}: error of predictions made before their own update,
+averaged over the stream; recovery after a shift; clean accuracy after
+adaptation. When exact adaptation improves on the frozen model, we also report
+$R = (\text{err}_\text{frozen} - \text{err}_\text{learned}) /
+(\text{err}_\text{frozen} - \text{err}_\text{exact})$. \emph{Cost}: operation
+counts, wall-clock per batch, and peak memory, with the predictor and all
+caches included.
+
+The gates are fixed before any test stream is run.
+
+\begin{enumerate}
+\item \textbf{Correctness.} With true errors inserted, the update routine
+reproduces the exact baseline. The outer gradient matches finite differences on
+a small smooth model.
+\item \textbf{Predictability.} At the pretrained checkpoint under shift, a
+regression-fit predictor reaches useful cosine with the true error at depth.
+This is a week-one measurement. If it fails, the project stops or narrows.
+\item \textbf{Adaptation.} The learned rule beats no adaptation,
+normalization-statistics adaptation, shortcut-only feedback, and DFA.
+\item \textbf{Attribution.} Against the learned rule on exact signals, the
+predicted signal retains most of the gain. Otherwise the result is about the
+rule and not the signal.
+\item \textbf{Frontier.} At one or more cost levels, the learned curve lies
+below the exact curve by more than seed variance. This replaces a fixed speedup
+threshold.
+\item \textbf{Training cost.} On the language task, wall-clock per outer step
+is lower than for the second-order outer loop at equal model, context, and
+adapted layers.
+\end{enumerate}
+
+\subsection{Schedule}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{L{2.0cm} L{13.0cm}}
+\toprule
+Weeks & Work \\
+\midrule
+1 & JAX infrastructure, residual-MLP correctness checks, cost profiler; predictability measurement on CIFAR-10-C \\
+2 & Reproduce exact baselines on CIFAR-10-C and CIFAR-100-C \\
+3--4 & Predictor Phases A--B; shortcut-only and DFA controls \\
+5--6 & Phase C; learned rule on exact signals; first frontier on CIFAR-C \\
+7--8 & ImageNet-C with ResNet-50, then ViT-B/16; continual protocol \\
+9 & Natural shifts; ConvNeXt \\
+10--11 & Dynamic evaluation; TTT-E2E-style small model; outer-loop cost \\
+12 & Replication across seeds and checkpoints; write-up \\
+\bottomrule
+\end{tabular}
+\caption{Indicative schedule for one researcher. Work stops or narrows at a
+failed gate.}
+\label{tab:schedule}
+\end{table}
+
+% =====================================================================
+\section{Risks and Open Questions}
+% =====================================================================
+
+\paragraph{Gradients may be hard to predict near convergence.} The negative
+result discussed in Section~\ref{sec:related} points this way. Distribution
+shift may restore structure to the error signal, but this is an empirical
+question, and it is the first one we answer.
+
+\paragraph{A rank-$r$ correction may be too weak.} The true branch term in
+\eqref{eq:exact} is full-rank. We sweep $r$ and report signal quality against
+predictor cost. If useful quality needs $r$ close to $d$, the cost argument
+fails.
+
+\paragraph{The equal-cost comparison is demanding.} TTT-E2E found that updating
+12 of 24 layers performed about the same as updating 6
+\parencite{tandon2025ttte2e}. If more adapted layers do not help even with
+exact gradients, noisier signals on more layers will not either, and the
+frontier will show it.
+
+\paragraph{Entropy is a weak seed.} Entropy minimization is known to collapse
+on long or mixed streams \parencite{niu2023sar,wang2022cotta}. Training the
+rule on supervised future loss is meant to counter this. It could instead
+inherit the failure, or overfit to the shift types seen in training.
+
+\paragraph{Cross-position error is only approximated.} The mixing step is
+cheap, and the true dependence through attention is not. The
+position-independent ablation measures how much this matters.
+
+\paragraph{Memory.} When each sequence carries its own fast weights, the update
+tensors are weight-sized per layer per sequence, and the outer loop holds $K$
+copies. This bounds batch size and unroll length before computation does.
+
+\paragraph{The predictor is tied to a checkpoint.} Its offline training cost is
+reported and must be amortized over deployment. Whether one predictor serves
+several checkpoints of an architecture is left for later.
+
+% =====================================================================
+\section{Summary}
+% =====================================================================
+
+The proposal tests one idea: at test time, the error at the output is exact and
+cheap, and the rest of the backward pass can be replaced by a small learned
+recurrence over depth that emits per-token error signals. The idea is assembled
+from parts that exist. What is new is the setting, a pretrained checkpoint
+adapting to a stream, and the evaluation, which separates three claims that are
+usually reported together: that the signals can be learned, that they support
+adaptation, and that they cost less. The cost model bounds the third claim in
+advance, at about 2$\times$ in the best case. Within that bound, the result we
+are after is a better quality--cost frontier on ImageNet-C and an outer loop
+that needs no gradients of gradients.
+
+\printbibliography
+
+\end{document}
