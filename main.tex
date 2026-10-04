@@ -65,10 +65,13 @@ forward pass, and predicts the error signal at each adapted layer for every
 token. Weight updates are formed from these signals exactly as in
 backpropagation, as sums of outer products $\deltahat x^\top$. The predictor is
 first trained to imitate true gradients and then trained through the loss on
-later data. None of these ingredients is new: synthetic gradients, direct
+later data. None of these ingredients is new. Synthetic gradients, direct
 feedback, and learned update rules have each been studied separately
-(Section~\ref{sec:related}). They have not been combined in the setting where
-they fit best, a pretrained checkpoint adapting online to a stream.
+(Section~\ref{sec:related}). Concurrent work even predicts the same per-token
+signals, but it does so to parallelize training and keeps the exact backward
+pass at test time \parencite{liu2026gradlev}. We study the opposite use:
+predicted signals at deployment, through the full depth of a pretrained
+checkpoint adapting online to a stream.
 
 A simple cost model (Section~\ref{sec:cost}) says what to expect. The predictor
 removes only the error-propagation part of the backward pass. The ceiling on
@@ -411,14 +414,44 @@ missing second-order support in the attention kernel
 finding and the other two: an end-to-end error signal at close to local cost,
 with a first-order outer loop.
 
-\subsubsection{Costate Prediction}
+\subsubsection{GradLev: Costate Prediction}
+\label{sec:gradlev}
 
-A concurrent preprint, GradLev (arXiv:2609.34174), predicts backward signals
-during training so that token-level test-time training can be trained in
-parallel, and discards the predictor at test time, where exact per-token
-gradients are used. It is the mirror image of this proposal, which uses exact
-gradients as training targets and predicted ones at test time. We have read
-only an excerpt.
+GradLev \parencite{liu2026gradlev} is the closest work to this proposal. Its
+problem is training, not deployment. Token-level test-time training is serial:
+the weights used at token $t$ depend on the gradient at token $t-1$. GradLev
+observes that once the \emph{costates}, the gradients at the outputs of the
+adapted layers, are given, online gradient descent is an affine recurrence in
+the weights. Parallel scans can then evaluate both the forward pass and the
+transposed backward pass. An auxiliary causal network predicts the costates
+for all tokens at once, from features below the adapted layers and the
+embedding of the observed target. A real backward pass through the resulting
+trajectory supplies exact costates, and a consistency loss pulls the
+predictions toward them. At exact consistency the parallel trajectory equals
+the serial one. At deployment the predictor is discarded, and the model updates
+from exact per-token gradients. The experiments are preliminary. A 300M
+language model that adapts only its final MLP improves validation loss by about
+0.002 nats over chunked updates and 0.003 over a static model, and the
+differences in downstream accuracy lie within the reported intervals.
+
+Three things carry over to our setting. The mechanism overlaps with ours:
+per-token error signals predicted by an auxiliary network, written as outer
+products, with the predictor trained on the trajectory that its own predictions
+produce (our Phase~B). GradLev's training is first-order as well. It stops
+gradients through the writes, which recovers a first-order MAML gradient at
+exact consistency. And predicted costates remove the serial dependence between
+tokens, which our exact seed does not: the output error at token $t$ depends on
+the adapted output.
+
+The differences define our contribution. GradLev keeps the backward pass at
+test time; we remove it. GradLev adapts one MLP and names a predictor that
+stays accurate across layers as an open problem; the recurrence over depth
+(Section~\ref{sec:recurrence}) is our answer to it. GradLev's predictor must
+match the gradient, because the deployed model uses the gradient; ours may
+depart from it when that lowers future loss. Finally, by our estimate, with one
+adapted MLP their two-block predictor costs more than the single-layer backward
+pass it would replace, so there is no reason to keep it at deployment. That
+changes once adaptation is deep, which is the regime we target.
 
 % ---------------------------------------------------------------------
 \subsection{Positioning}
@@ -439,6 +472,7 @@ FLP & meta-learned feedback & none & yes \\
 MGTTA & exact, then transformed & full network & yes \\
 TTT layers & exact, local loss & one layer & outer loop \\
 TTT-E2E & exact, end loss & last quarter of blocks & yes, second-order \\
+GradLev & predicted in training, exact at test time & adapted layers, every token & yes, first-order \\
 \midrule
 This proposal & predicted from the exact output error & none beyond the output seed & yes, first-order \\
 \bottomrule
@@ -480,7 +514,8 @@ $\delta = \partial L/\partial y$ and normalized input $\tilde{x}$,
 \end{equation}
 Convolutions follow \eqref{eq:linear} with input patches in place of $x$. In
 both cases the forward quantity is already in memory, and the only missing
-quantity is $\delta$. The method predicts $\delta$ for every token and leaves
+quantity is $\delta$, the costate in the terminology of GradLev
+\parencite{liu2026gradlev}. The method predicts $\delta$ for every token and leaves
 \eqref{eq:linear}--\eqref{eq:norm} untouched. It does not predict weight
 matrices or low-rank factors. Per-token signals keep the procedure identical to
 backpropagation with one term replaced, which is what makes the comparison with
@@ -504,6 +539,7 @@ normalization, giving the error $d_{L+1}$ at the top of the residual stream.
 This is the only true gradient the deployed method uses.
 
 \subsection{A Recurrence over Depth}
+\label{sec:recurrence}
 
 Write block $l$ as $h_{l+1} = \sigma_l\!\left(P_l h_l + F_l(h_l)\right)$, where
 $P_l$ is the shortcut (identity or projection), $F_l$ the residual branch, and
@@ -551,10 +587,15 @@ ConvNets and an anti-causal depthwise 1-D convolution for sequences. The
 position-independent predictor is an ablation.
 
 \paragraph{Parallelism.} Positions are processed in parallel. The recurrence is
-sequential over $L$ blocks, each step a pair of small matrix products. Updates
-are applied once per chunk (a batch of images, or a mini-batch of tokens as in
-TTT-E2E), since updating after every token would make the forward pass itself
-serial. The sums in \eqref{eq:linear}--\eqref{eq:norm} are batched matrix
+sequential over $L$ blocks, each step a pair of small matrix products. With an
+exact seed, updates are applied once per chunk (a batch of images, or a
+mini-batch of tokens as in TTT-E2E): the output error at a token depends on the
+adapted output, so updating after every token would make the forward pass
+serial. GradLev removes this dependence by predicting costates from features
+that do not depend on the fast weights, after which token-level updates are
+parallel scans \parencite{liu2026gradlev}. This gives two variants: an exact
+seed with chunked updates, our default, and a predicted seed with token-level
+updates. We compare them on the language task. The sums in \eqref{eq:linear}--\eqref{eq:norm} are batched matrix
 products. In JAX: \texttt{einsum} for the updates, \texttt{lax.scan} over
 depth, and \texttt{vmap} over sequences when each sequence carries its own fast
 weights.
@@ -589,7 +630,10 @@ $g_\phi$ is a composition of a forward pass, a closed-form seed, the recurrence
 \eqref{eq:linear}--\eqref{eq:norm}. It contains no call to reverse-mode
 differentiation, so $\nabla_\phi J$ is one ordinary reverse pass through the
 unroll. With an exact inner gradient the same objective requires
-reverse-over-reverse. We start at $K=2$, keep an imitation term with a decaying
+reverse-over-reverse. First-order training alone is not new: GradLev obtains it
+by stopping gradients through the writes, which approximates the
+meta-gradient. Here the writes are an explicit function of $\phi$, so the
+first-order pass is the exact gradient of the learned rule. We start at $K=2$, keep an imitation term with a decaying
 weight, and always compare three variants: imitation only, outer training from
 random initialization, and imitation followed by outer training.
 
@@ -730,6 +774,9 @@ Outer training from random initialization & whether imitation is a useful starti
 Exact adaptation at depth $\tfrac18, \tfrac14, \tfrac12, 1$ & the exact quality--cost frontier \\
 Exact updates at matched reduced frequency & whether predicting between exact steps beats skipping them \\
 Local-loss TTT layer (language) & the existing cheap alternative to a deep backward pass \\
+GradLev as published (language) & exact per-token gradients at test time; the reference for token-level adaptation \\
+GradLev with its predictor kept at deployment & predicted costates without an exact seed or a recurrence over depth \\
+Predicted seed with token-level updates & whether the exact seed is worth giving up token-level parallelism \\
 \bottomrule
 \end{tabular}
 \caption{Baselines. The row in bold is the control missing from most learned-feedback
@@ -751,6 +798,13 @@ $R = (\text{err}_\text{frozen} - \text{err}_\text{learned}) /
 (\text{err}_\text{frozen} - \text{err}_\text{exact})$. \emph{Cost}: operation
 counts, wall-clock per batch, and peak memory, with the predictor and all
 caches included.
+
+Effect sizes differ sharply between the two domains. On ImageNet-C, adaptation
+moves error by many points. On language, GradLev's gain over chunked updates is
+about 0.002 nats \parencite{liu2026gradlev}, and the gain TTT-E2E obtains from
+the end-to-end loss is 0.013 \parencite{tandon2025ttte2e}. Language
+comparisons therefore use three or more training seeds, paired evaluation on a
+fixed token set, and intervals over seeds.
 
 The gates are fixed before any test stream is run.
 
@@ -831,6 +885,13 @@ position-independent ablation measures how much this matters.
 tensors are weight-sized per layer per sequence, and the outer loop holds $K$
 copies. This bounds batch size and unroll length before computation does.
 
+\paragraph{Concurrent work may close the gap.} GradLev becomes a backward-free
+method if its predictor is kept at deployment
+(Section~\ref{sec:gradlev}). Its authors have no reason to do this while
+adapting one layer, but deeper adaptation is their stated next step. Our vision
+experiments lie outside that line of work, and on language we run the
+kept-predictor variant ourselves as a baseline.
+
 \paragraph{The predictor is tied to a checkpoint.} Its offline training cost is
 reported and must be amortized over deployment. Whether one predictor serves
 several checkpoints of an architecture is left for later.
@@ -842,8 +903,9 @@ several checkpoints of an architecture is left for later.
 The proposal tests one idea: at test time, the error at the output is exact and
 cheap, and the rest of the backward pass can be replaced by a small learned
 recurrence over depth that emits per-token error signals. The idea is assembled
-from parts that exist. What is new is the setting, a pretrained checkpoint
-adapting to a stream, and the evaluation, which separates three claims that are
+from parts that exist. What is new is where the predicted signal is used, at
+deployment and through the full depth of a pretrained checkpoint adapting to a
+stream, and the evaluation, which separates three claims that are
 usually reported together: that the signals can be learned, that they support
 adaptation, and that they cost less. The cost model bounds the third claim in
 advance, at about 2$\times$ in the best case. Within that bound, the result we
