@@ -73,10 +73,41 @@ def maxpool(x):
         x, -jnp.inf, jax.lax.max, (1, 3, 3, 1), (1, 2, 2, 1), [(0, 0), (1, 1), (1, 1), (0, 0)])
 
 
-def apply(params, stats, x, *, batch_stats, probes=None):
-    """x: (N, 224, 224, 3) normalized images. Returns (logits, x_hats).
+def blocks() -> list[tuple[str, int, bool]]:
+    """(prefix, stride, has_projection) for every bottleneck block, in forward order."""
+    return [(f"{stage}.{b}", stride if b == 0 else 1, b == 0)
+            for stage, n, _, stride in STAGES for b in range(n)]
+
+
+def plain_bn(params, stats, batch_stats):
+    """bn(name, h) -> y, without probes or recording."""
+    return lambda name, h: batchnorm(params[name], stats[name], h, batch_stats)[0]
+
+
+def branch(params, pre, h, stride, bn):
+    """Residual branch F(h) of a bottleneck block."""
+    out = jax.nn.relu(bn(f"{pre}.bn1", conv(params[f"{pre}.conv1"], h)))
+    out = jax.nn.relu(bn(f"{pre}.bn2", conv(params[f"{pre}.conv2"], out, stride=stride)))
+    return bn(f"{pre}.bn3", conv(params[f"{pre}.conv3"], out))
+
+
+def shortcut(params, pre, h, stride, bn, projection):
+    """Shortcut P(h): identity, or 1x1 conv + BN where the shape changes."""
+    if not projection:
+        return h
+    return bn(f"{pre}.downsample.1", conv(params[f"{pre}.downsample.0"], h, stride=stride))
+
+
+def head(params, h):
+    feats = jnp.mean(h, axis=(1, 2))
+    return jnp.einsum("nc,kc->nk", feats, params["fc"]["w"]) + params["fc"]["b"]
+
+
+def apply(params, stats, x, *, batch_stats, probes=None, return_blocks=False):
+    """x: (N, 224, 224, 3) normalized images. Returns (logits, x_hats[, block_io]).
 
     probes: optional {bn_name: zeros like that BN's output}; added to the output.
+    block_io: [(h_in, h_out)] for every block, i.e. the residual stream.
     """
     x_hats = {}
 
@@ -86,19 +117,14 @@ def apply(params, stats, x, *, batch_stats, probes=None):
 
     h = jax.nn.relu(bn("bn1", conv(params["conv1"], x, stride=2)))
     h = maxpool(h)
-    for stage, blocks, _, stride in STAGES:
-        for b in range(blocks):
-            pre = f"{stage}.{b}"
-            s = stride if b == 0 else 1
-            out = jax.nn.relu(bn(f"{pre}.bn1", conv(params[f"{pre}.conv1"], h)))
-            out = jax.nn.relu(bn(f"{pre}.bn2", conv(params[f"{pre}.conv2"], out, stride=s)))
-            out = bn(f"{pre}.bn3", conv(params[f"{pre}.conv3"], out))
-            if b == 0:
-                h = bn(f"{pre}.downsample.1", conv(params[f"{pre}.downsample.0"], h, stride=s))
-            h = jax.nn.relu(out + h)
-    feats = jnp.mean(h, axis=(1, 2))
-    logits = jnp.einsum("nc,kc->nk", feats, params["fc"]["w"]) + params["fc"]["b"]
-    return logits, x_hats
+    block_io = []
+    for pre, stride, projection in blocks():
+        h_in = h
+        out = branch(params, pre, h, stride, bn)
+        h = jax.nn.relu(out + shortcut(params, pre, h, stride, bn, projection))
+        block_io.append((h_in, h))
+    logits = head(params, h)
+    return (logits, x_hats, block_io) if return_blocks else (logits, x_hats)
 
 
 def probe_shapes(params, stats, x) -> dict:

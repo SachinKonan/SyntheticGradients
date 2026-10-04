@@ -18,91 +18,28 @@ Run on every host of the slice (tpu/run.sh), or locally on CPU for a smoke test:
 """
 
 import argparse
-import concurrent.futures as cf
 import functools
 import json
-import os
-import queue
-import subprocess
-import threading
 import time
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from array_record.python.array_record_module import ArrayRecordReader
-from jax.experimental import multihost_utils
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from sg import tent
 from sg.data import imagenet
-from sg.data.records import decode
+from sg.experiments import streams as st
 from sg.models import resnet
 
 METHODS = ("source", "bn_adapt", "tent")
 
-
-# ----------------------------------------------------------------------------- data
 
 def stream_specs():
     """(group, order) for every stream. Order 0 is the stored (pre-shuffled) order."""
     groups = [f"imagenet_c/{c}/5" for c in imagenet.TEST_CORRUPTIONS] + ["imagenet_val"]
     return [(g, order) for order in (0, 1) for g in groups]
 
-
-def fetch(root: str, rel: str, cache: Path) -> Path:
-    """Local path of root/rel. A gs:// root is copied into the cache once."""
-    if not root.startswith("gs://"):
-        return Path(root, rel)
-    dst = cache / rel
-    if not (dst / ".complete").exists():
-        dst.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["gcloud", "storage", "cp", "-r", f"{root}/{rel}/*", str(dst)], check=True)
-        (dst / ".complete").touch()
-    return dst
-
-
-class Stream:
-    def __init__(self, group_dir: Path, order: int, batch: int):
-        self.records = []
-        for path in imagenet.shard_paths(group_dir, ""):
-            reader = ArrayRecordReader(str(path))
-            self.records += reader.read_all()
-            reader.close()
-        n = len(self.records)
-        self.perm = np.arange(n) if order == 0 else np.random.default_rng(order).permutation(n)
-        self.batch = batch
-        self.num_steps = n // batch
-
-    def batch_records(self, step):
-        return [self.records[i] for i in self.perm[step * self.batch:(step + 1) * self.batch]]
-
-
-def prefetch_batches(streams, num_steps, workers, depth=3):
-    """Background thread that decodes (local_streams, B, 224, 224, 3) uint8 batches."""
-    q = queue.Queue(maxsize=depth)
-    pool = cf.ThreadPoolExecutor(workers)
-
-    def decode_one(rec):
-        label, _, jpeg = decode(rec)
-        return imagenet.load_uint8(jpeg), label
-
-    def run():
-        for step in range(num_steps):
-            recs = [r for s in streams for r in s.batch_records(step)]
-            out = list(pool.map(decode_one, recs))
-            x = np.stack([o[0] for o in out]).reshape(len(streams), -1, 224, 224, 3)
-            y = np.array([o[1] for o in out], np.int32).reshape(len(streams), -1)
-            q.put((x, y))
-        q.put(None)
-
-    threading.Thread(target=run, daemon=True).start()
-    while (item := q.get()) is not None:
-        yield item
-
-
-# ----------------------------------------------------------------------------- model
 
 def stream_step(bn, velocity, totals, x_uint8, y, params, stats, bn0, *, lr, momentum):
     """One batch of one stream. Returns updated (bn, velocity, totals)."""
@@ -116,101 +53,59 @@ def stream_step(bn, velocity, totals, x_uint8, y, params, stats, bn0, *, lr, mom
     return tent.bn_params(new_params), velocity, totals + correct
 
 
-def global_from_local(local, sharding, global_shape, local_index):
-    """Assemble a stream-sharded global array from this host's stream slices."""
-    arrays = [jax.device_put(local[local_index[d]], d) for d in sharding.addressable_devices]
-    return jax.make_array_from_single_device_arrays(global_shape, sharding, arrays)
-
-
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-root", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/data/imagenet_v1")
-    p.add_argument("--weights", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/weights/resnet50_tv_in1k.safetensors")
-    p.add_argument("--local-cache", default=os.path.expanduser("~/synthgrad/cache"))
-    p.add_argument("--out", required=True, help="results dir (local or gs://)")
+    st.add_launch_args(p)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--lr", type=float, default=2.5e-4)
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--steps", type=int, default=None, help="cap steps (smoke tests)")
     p.add_argument("--streams", type=int, default=None, help="use the first N streams (smoke tests)")
-    p.add_argument("--precision", default="highest", choices=["default", "high", "highest"])
-    p.add_argument("--decode-workers", type=int, default=min(64, os.cpu_count()))
-    p.add_argument("--coordinator", default=None)
-    p.add_argument("--num-processes", type=int, default=1)
-    p.add_argument("--process-id", type=int, default=0)
     args = p.parse_args()
 
-    if args.num_processes > 1:
-        jax.distributed.initialize(args.coordinator, args.num_processes, args.process_id)
-    jax.config.update("jax_default_matmul_precision", args.precision)
+    st.init_distributed(args)
     lead = jax.process_index() == 0
     log = (lambda *a: print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)) if lead else (lambda *a: None)
 
     specs = stream_specs()[: args.streams]
-    devices = np.array(jax.devices())
-    assert len(specs) % len(devices) == 0, f"{len(specs)} streams for {len(devices)} devices"
-    mesh = Mesh(devices, ("streams",))
-    shard = NamedSharding(mesh, P("streams"))
-    repl = NamedSharding(mesh, P())
-    num_streams = len(specs)
-    log(f"{jax.process_count()} hosts, {len(devices)} devices, {num_streams} streams")
-
-    # Which global streams live on this host; each local device holds a contiguous range.
-    ranges = {d: range(*sl[0].indices(num_streams))
-              for d, sl in shard.addressable_devices_indices_map((num_streams,)).items()}
-    local_ids = sorted(i for r in ranges.values() for i in r)
-    pos = {s: k for k, s in enumerate(local_ids)}
-    local_index = {d: slice(pos[r[0]], pos[r[-1]] + 1) for d, r in ranges.items()}
+    sm = st.StreamMesh(len(specs))
+    log(f"{jax.process_count()} hosts, {len(jax.devices())} devices, {len(specs)} streams")
 
     cache = Path(args.local_cache)
     t0 = time.time()
-    streams = [Stream(fetch(args.data_root, specs[s][0], cache), specs[s][1], args.batch) for s in local_ids]
-    weights = args.weights
-    if weights.startswith("gs://"):
-        cache.mkdir(parents=True, exist_ok=True)
-        local_w = cache / Path(weights).name
-        if not local_w.exists():
-            subprocess.run(["gcloud", "storage", "cp", weights, str(local_w)], check=True)
-        weights = str(local_w)
+    streams = [st.Stream(st.fetch(args.data_root, specs[s][0], cache), specs[s][1], args.batch)
+               for s in sm.local_ids]
+    weights = st.fetch_file(args.weights, cache)
     log(f"data + weights ready in {time.time() - t0:.0f}s")
 
-    num_steps = min(s.num_steps for s in streams)
-    if jax.process_count() > 1:
-        num_steps = int(np.min(multihost_utils.process_allgather(np.array([num_steps]))))
+    num_steps = st.common_steps(streams)
     if args.steps:
         num_steps = min(num_steps, args.steps)
 
-    params_np, stats_np = resnet.load_torchvision(weights)
-    put_repl = lambda t: jax.tree.map(lambda a: jax.make_array_from_callback(a.shape, repl, lambda i: a[i]), t)
-    params, stats = put_repl(params_np), put_repl(stats_np)
+    params, stats = sm.replicate(resnet.load_torchvision(weights))
     bn0 = tent.bn_params(params)
 
-    @functools.partial(jax.jit, out_shardings=shard)
+    @functools.partial(jax.jit, out_shardings=sm.shard)
     def init_state(bn0):
-        bcast = lambda a: jnp.broadcast_to(a, (num_streams,) + a.shape)
-        bn = jax.tree.map(bcast, bn0)
-        return bn, jax.tree.map(jnp.zeros_like, bn), jnp.zeros((num_streams, len(METHODS)), jnp.int32)
+        bn = jax.tree.map(lambda a: jnp.broadcast_to(a, (len(specs),) + a.shape), bn0)
+        return bn, jax.tree.map(jnp.zeros_like, bn), jnp.zeros((len(specs), len(METHODS)), jnp.int32)
 
     step_fn = jax.jit(
         jax.vmap(functools.partial(stream_step, lr=args.lr, momentum=args.momentum),
                  in_axes=(0, 0, 0, 0, 0, None, None, None)),
-        out_shardings=(shard, shard, shard), donate_argnums=(0, 1, 2))
+        out_shardings=(sm.shard, sm.shard, sm.shard), donate_argnums=(0, 1, 2))
 
     bn, velocity, totals = init_state(bn0)
-    x_shape = (num_streams, args.batch, 224, 224, 3)
     t0 = time.time()
-    for step, (x, y) in enumerate(prefetch_batches(streams, num_steps, args.decode_workers)):
-        xg = global_from_local(x, shard, x_shape, local_index)
-        yg = global_from_local(y, shard, x_shape[:2], local_index)
-        bn, velocity, totals = step_fn(bn, velocity, totals, xg, yg, params, stats, bn0)
+    for step, (x, y) in enumerate(st.prefetch_batches(streams, num_steps, args.decode_workers)):
+        bn, velocity, totals = step_fn(bn, velocity, totals, sm.put(x), sm.put(y), params, stats, bn0)
         if step == 0 or (step + 1) % 100 == 0 or step + 1 == num_steps:
-            tot = np.asarray(multihost_utils.process_allgather(totals, tiled=True))
-            seen = (step + 1) * args.batch
-            err = 100 * (1 - tot.sum(0) / (seen * num_streams))
+            tot = sm.gather(totals)
+            err = 100 * (1 - tot.sum(0) / ((step + 1) * args.batch * len(specs)))
             log(f"step {step + 1}/{num_steps}  {(time.time() - t0) / (step + 1):.3f}s/step  "
                 + "  ".join(f"{m} {e:.1f}" for m, e in zip(METHODS, err)))
 
-    tot = np.asarray(multihost_utils.process_allgather(totals, tiled=True))
+    tot = sm.gather(totals)
     if lead:
         write_results(args, specs, tot, num_steps * args.batch)
 
@@ -230,15 +125,8 @@ def write_results(args, specs, totals, images_per_stream):
         "config": vars(args), "images_per_stream": images_per_stream,
         "error_pct": {"imagenet_c_mean": mean_c, "per_group": summary}, "per_stream": per_stream,
     }
-    text = json.dumps(result, indent=1)
     print("RESULT " + json.dumps(result["error_pct"]), flush=True)
-    if args.out.startswith("gs://"):
-        local = Path("/tmp/synthgrad-results.json")
-        local.write_text(text)
-        subprocess.run(["gcloud", "storage", "cp", str(local), f"{args.out}/results.json"], check=True)
-    else:
-        Path(args.out).mkdir(parents=True, exist_ok=True)
-        Path(args.out, "results.json").write_text(text)
+    st.write_output(args.out, "results.json", json.dumps(result, indent=1).encode())
 
 
 if __name__ == "__main__":
