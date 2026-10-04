@@ -103,10 +103,12 @@ def head(params, h):
     return jnp.einsum("nc,kc->nk", feats, params["fc"]["w"]) + params["fc"]["b"]
 
 
-def apply(params, stats, x, *, batch_stats, probes=None, return_blocks=False):
+def apply(params, stats, x, *, batch_stats, probes=None, stream_probes=None, return_blocks=False):
     """x: (N, 224, 224, 3) normalized images. Returns (logits, x_hats[, block_io]).
 
     probes: optional {bn_name: zeros like that BN's output}; added to the output.
+    stream_probes: optional [zeros like each block's output]; added to h_out, so
+        their gradient is dL/dh_out of every block.
     block_io: [(h_in, h_out)] for every block, i.e. the residual stream.
     """
     x_hats = {}
@@ -118,10 +120,12 @@ def apply(params, stats, x, *, batch_stats, probes=None, return_blocks=False):
     h = jax.nn.relu(bn("bn1", conv(params["conv1"], x, stride=2)))
     h = maxpool(h)
     block_io = []
-    for pre, stride, projection in blocks():
+    for k, (pre, stride, projection) in enumerate(blocks()):
         h_in = h
         out = branch(params, pre, h, stride, bn)
         h = jax.nn.relu(out + shortcut(params, pre, h, stride, bn, projection))
+        if stream_probes is not None:
+            h = h + stream_probes[k]
         block_io.append((h_in, h))
     logits = head(params, h)
     return (logits, x_hats, block_io) if return_blocks else (logits, x_hats)
