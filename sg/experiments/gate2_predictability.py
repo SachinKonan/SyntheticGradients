@@ -2,17 +2,19 @@
 
 Fit phase. The 4 held-out ImageNet-C corruptions (severities 1-5) on even val
 image ids. Exact Tent runs on every stream; meanwhile DFA is fit by ridge
-regression and the depth recurrence is trained onto the true signals (--target).
-Each step draws the number of exactly backpropagated top blocks k from
---exact-tops, so one recurrence serves every hybrid setting.
+regression and the depth recurrence is trained onto the true signals (--target),
+always against the exact gradient of all 53 BNs. Each step draws the number of
+exactly backpropagated top blocks k; with --k-schedule anneal, early steps only
+use large k (few blocks to predict) and the floor falls to 0 over the first
+75% of training. One recurrence serves every hybrid setting.
 
 Test phase. The 15 test corruptions at severity 5, and clean val, on odd val
 image ids (no image is shared with the fit phase). Exact Tent runs again, and at
-every step each predictor is scored against the true signals at the 20
-residual taps (bn3 of every block, downsample BN of projection blocks):
+every step each predictor is scored against the true signals at all 53 BNs
+that Tent updates:
 
   per tap   cos / norm ratio of delta, and of the BN (scale, bias) gradient
-  full      cos / norm ratio of all 20 taps' BN gradients joined into one vector
+  full      cos / norm ratio of all 53 BN gradients joined into one vector
 
 Scores are averaged per quarter of each stream, to show drift as Tent moves the
 weights. The states are those reached by exact Tent; running Tent on predicted
@@ -20,7 +22,7 @@ signals is the next gate.
 
 Predictors:
   dfa_random, dfa_fit   one projection of the logit error per tap
-  shortcut@k            exact top k blocks, then the shortcut path only
+  shortcut@k            exact top k blocks, then the shortcut path only (branch BNs get nothing)
   recurrence@k          exact top k blocks, then shortcut + learned correction
 """
 
@@ -70,48 +72,51 @@ def method_names(exact_tops):
 
 # ----------------------------------------------------------------------------- losses
 
-def rec_loss(rec, params, stats, block_io, d_stream, exact_top, true, x_hats, target):
-    pred = feedback.backward_over_depth(params, stats, block_io, d_stream, exact_top=exact_top, rec=rec)
-    taps = feedback.residual_taps()
+def rec_loss(rec, params, stats, fwd, d_stream, exact_top, true, target):
+    """Loss of the predicted signals against the exact ones, over all 53 BNs."""
+    x_hats, block_io, stem = fwd
+    pred = feedback.backward_over_depth(params, stats, x_hats, block_io, stem, d_stream, true,
+                                        exact_top=exact_top, rec=rec)
+    taps = feedback.all_taps()
     if target == "delta":
         per_tap = [jnp.sum(jnp.square(pred[t] - true[t])) / (jnp.sum(jnp.square(true[t])) + 1e-30) for t in taps]
-        loss = jnp.mean(jnp.stack(per_tap))
-    else:
-        gp, gt = feedback.tap_grads(pred, x_hats), feedback.tap_grads(true, x_hats)
-        cos = lambda a, b: jnp.dot(a, b) / (jnp.linalg.norm(a) * jnp.linalg.norm(b) + 1e-30)
-        if target == "tap_cos":
-            loss = jnp.mean(jnp.stack([1 - cos(gp[t], gt[t]) for t in taps]))
-        else:  # full_cos
-            loss = 1 - cos(jnp.concatenate([gp[t] for t in taps]), jnp.concatenate([gt[t] for t in taps]))
-    return loss, pred
+        return jnp.mean(jnp.stack(per_tap)), pred
+    gp, gt = feedback.tap_grads(pred, x_hats), feedback.tap_grads(true, x_hats)
+    cos = lambda a, b: jnp.dot(a, b) / (jnp.linalg.norm(a) * jnp.linalg.norm(b) + 1e-30)
+    if target == "tap_cos":
+        return jnp.mean(jnp.stack([1 - cos(gp[t], gt[t]) for t in taps])), pred
+    gp, gt = jnp.concatenate([gp[t] for t in taps]), jnp.concatenate([gt[t] for t in taps])
+    if target == "full_cos":
+        return 1 - cos(gp, gt), pred
+    return jnp.sum(jnp.square(gp - gt)) / (jnp.sum(jnp.square(gt)) + 1e-30), pred  # full_mse
 
 
 # ----------------------------------------------------------------------------- per-stream steps
 
 def fit_stream(bn, velocity, dfa_acc, x_uint8, y, exact_top, params, stats, rec, *, lr, momentum, target):
     p = {**params, **bn}
-    logits, deltas, d_stream, x_hats, block_io, e = feedback.exact_signals(
+    logits, true, d_stream, x_hats, block_io, stem, e = feedback.exact_signals(
         p, stats, imagenet.normalize(x_uint8), tent.entropy)
-    true = {t: deltas[t] for t in feedback.residual_taps()}
     (loss, pred), grad = jax.value_and_grad(rec_loss, has_aux=True)(
-        rec, p, stats, block_io, d_stream, exact_top, true, x_hats, target)
+        rec, p, stats, (x_hats, block_io, stem), d_stream, exact_top, true, target)
     dfa_acc = jax.tree.map(jnp.add, dfa_acc, feedback.dfa_stats(e, true))
     _, full = feedback.compare(pred, true, x_hats)
-    bn, velocity = tent.sgd_momentum(bn, resnet.bn_grads(deltas, x_hats), velocity, lr, momentum)
+    bn, velocity = tent.sgd_momentum(bn, resnet.bn_grads(true, x_hats), velocity, lr, momentum)
     return bn, velocity, dfa_acc, loss, grad, full, jnp.sum(logits.argmax(-1) == y)
 
 
 def test_stream(bn, velocity, acc, x_uint8, y, quarter, params, stats, rec, w_fit, w_rand,
                 *, lr, momentum, exact_tops):
     p = {**params, **bn}
-    logits, deltas, d_stream, x_hats, block_io, e = feedback.exact_signals(
+    logits, true, d_stream, x_hats, block_io, stem, e = feedback.exact_signals(
         p, stats, imagenet.normalize(x_uint8), tent.entropy)
-    true = {t: deltas[t] for t in feedback.residual_taps()}
-    preds = [feedback.dfa_predict(w_rand, e, block_io), feedback.dfa_predict(w_fit, e, block_io)]
-    preds += [feedback.backward_over_depth(p, stats, block_io, d_stream, exact_top=k) for k in exact_tops]
-    preds += [feedback.backward_over_depth(p, stats, block_io, d_stream, exact_top=k, rec=rec) for k in exact_tops]
+    masks = feedback.tap_masks(p, x_hats, block_io, stem)
+    back = functools.partial(feedback.backward_over_depth, p, stats, x_hats, block_io, stem, d_stream, true)
+    preds = [feedback.dfa_predict(w_rand, e, masks), feedback.dfa_predict(w_fit, e, masks)]
+    preds += [back(exact_top=k) for k in exact_tops]
+    preds += [back(exact_top=k, rec=rec) for k in exact_tops]
     per_tap, full = zip(*[feedback.compare(pr, true, x_hats) for pr in preds])
-    grads = resnet.bn_grads(deltas, x_hats)
+    grads = resnet.bn_grads(true, x_hats)
     gnorm2 = jnp.stack([jnp.sum(jnp.square(grads[n]["scale"])) + jnp.sum(jnp.square(grads[n]["bias"]))
                         for n in resnet.bn_names()])
     acc = {"scores": acc["scores"].at[quarter].add(jnp.stack(per_tap)),
@@ -144,7 +149,9 @@ def main():
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--lr", type=float, default=2.5e-4, help="Tent")
     p.add_argument("--momentum", type=float, default=0.9, help="Tent")
-    p.add_argument("--target", default="full_cos", choices=["delta", "tap_cos", "full_cos"])
+    p.add_argument("--target", default="full_cos", choices=["delta", "tap_cos", "full_cos", "full_mse"])
+    p.add_argument("--k-schedule", default="anneal", choices=["anneal", "uniform"],
+                   help="training draws of k (exact top blocks): uniform over 0..15, or a floor annealed 15 -> 0")
     p.add_argument("--rank", type=int, default=64)
     p.add_argument("--no-mix", action="store_true")
     p.add_argument("--rec-lr", type=float, default=1e-3)
@@ -166,7 +173,7 @@ def main():
     S = len(fspecs)
     sm = st.StreamMesh(S)
     log(f"{jax.process_count()} hosts, {len(jax.devices())} devices, {S} streams per phase; "
-        f"target {args.target}, rank {args.rank}, exact_tops {exact_tops}")
+        f"target {args.target}, rank {args.rank}, k-schedule {args.k_schedule}, exact_tops {exact_tops}")
 
     cache = Path(args.local_cache)
     t0 = time.time()
@@ -183,7 +190,7 @@ def main():
     opt = sm.replicate({"t": np.zeros((), np.int32), "m": jax.tree.map(np.zeros_like, rec),
                         "v": jax.tree.map(np.zeros_like, rec)})
     w_rand = sm.replicate(feedback.dfa_random(jax.random.key(1)))
-    taps = feedback.residual_taps()
+    taps = feedback.all_taps()
     tent_kw = dict(lr=args.lr, momentum=args.momentum)
 
     @functools.partial(jax.jit, out_shardings=sm.shard)
@@ -213,6 +220,13 @@ def main():
     if args.steps:
         fit_steps = min(fit_steps, args.steps)
     k_rng = np.random.default_rng(0)  # same draws on every host
+    k_max = len(resnet.blocks()) - 1
+    total_steps = args.fit_passes * fit_steps
+
+    def draw_k(t):
+        floor = 0 if args.k_schedule == "uniform" else round(k_max * max(0.0, 1 - t / (0.75 * total_steps)))
+        return np.int32(k_rng.integers(floor, k_max + 1))
+
     t0 = time.time()
     for pass_ in range(args.fit_passes):
         for s, spec_id in zip(fit, sm.local_ids):  # a new order each pass
@@ -220,7 +234,7 @@ def main():
                 s.perm = np.random.default_rng(1000 * pass_ + spec_id).permutation(len(s.records))
         bn, velocity = fresh_tent(bn0)
         for step, (x, y) in enumerate(st.prefetch_batches(fit, fit_steps, args.decode_workers)):
-            k = np.int32(k_rng.choice(exact_tops))
+            k = draw_k(pass_ * fit_steps + step)
             bn, velocity, dfa_acc, rec, opt, info = fit_step(bn, velocity, dfa_acc, sm.put(x), sm.put(y), k, rec, opt)
             if step % 50 == 0 or step + 1 == fit_steps:
                 info = jax.device_get(info)
@@ -273,13 +287,30 @@ def main():
 
 
 def _tap_shapes(batch):
-    """Shapes of the residual-tap deltas for a batch of 224x224 images."""
-    sizes = {"layer1": (56, 256), "layer2": (28, 512), "layer3": (14, 1024), "layer4": (7, 2048)}
-    out = {}
-    for tap in feedback.residual_taps():
-        hw, c = sizes[tap.split(".")[0]]
-        out[tap] = jax.ShapeDtypeStruct((batch, hw, hw, c), jnp.float32)
-    return out
+    """Shapes of every BN's delta for a batch of 224x224 images."""
+    x = jax.ShapeDtypeStruct((batch, 224, 224, 3), jnp.float32)
+    params, stats = jax.eval_shape(lambda: resnet_shapes())
+    _, x_hats = jax.eval_shape(lambda p, s, x: resnet.apply(p, s, x, batch_stats=True), params, stats, x)
+    return x_hats
+
+
+def resnet_shapes():
+    """Zero ResNet-50 params/stats with the right shapes (for shape inference only)."""
+    widths, params, stats = feedback.tap_widths(), {}, {}
+    for name, c in widths.items():
+        params[name] = {"scale": jnp.zeros(c), "bias": jnp.zeros(c)}
+        stats[name] = {"mean": jnp.zeros(c), "var": jnp.ones(c)}
+    params["conv1"] = {"w": jnp.zeros((7, 7, 3, 64))}
+    for (pre, _, projection), c_in, c_out in zip(resnet.blocks(), feedback.block_in_widths(),
+                                                 feedback.block_out_widths()):
+        mid = c_out // resnet.EXPANSION
+        params[f"{pre}.conv1"] = {"w": jnp.zeros((1, 1, c_in, mid))}
+        params[f"{pre}.conv2"] = {"w": jnp.zeros((3, 3, mid, mid))}
+        params[f"{pre}.conv3"] = {"w": jnp.zeros((1, 1, mid, c_out))}
+        if projection:
+            params[f"{pre}.downsample.0"] = {"w": jnp.zeros((1, 1, c_in, c_out))}
+    params["fc"] = {"w": jnp.zeros((1000, 2048)), "b": jnp.zeros(1000)}
+    return params, stats
 
 
 def write_results(args, specs, taps, methods, exact_tops, acc, curve, steps):
@@ -309,7 +340,7 @@ def write_results(args, specs, taps, methods, exact_tops, acc, curve, steps):
     gnorm2 = acc["gnorm2"][corrupt].sum(0)
     share = gnorm2 / gnorm2.sum()
     grad_share = {name: float(v) for name, v in zip(resnet.bn_names(), share)}
-    residual_share = float(sum(grad_share[t] for t in taps))
+    residual_share = float(sum(grad_share[t] for t in feedback.residual_taps()))
 
     by_group = {}
     for i, (g, _) in enumerate(specs):
@@ -335,6 +366,13 @@ def write_results(args, specs, taps, methods, exact_tops, acc, curve, steps):
         print(f"  {k:12d} {cost[k]:6.2f} {fc[f'shortcut@{k}']['cos']:9.3f} {fc[f'recurrence@{k}']['cos']:11.3f}",
               flush=True)
     print(f"residual taps hold {100 * residual_share:.1f}% of the true BN gradient norm^2", flush=True)
+    print("per-stage cos_grad (recurrence@0 | shortcut@0), mean over taps:", flush=True)
+    pt = result["per_tap_corrupt"]
+    for stage in ("bn1", "layer1", "layer2", "layer3", "layer4"):
+        ts = [t for t in taps if t == stage or t.startswith(stage + ".")]
+        r = np.mean([pt["recurrence@0"][t]["cos_grad"] for t in ts])
+        sc = np.mean([pt["shortcut@0"][t]["cos_grad"] for t in ts])
+        print(f"  {stage:7s} {r:.3f} | {sc:.3f}", flush=True)
     st.write_output(args.out, "results.json", json.dumps(result, indent=1).encode())
 
 
