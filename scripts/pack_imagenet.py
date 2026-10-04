@@ -27,15 +27,8 @@ import h5py
 import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 
+from sg.data.imagenet import EXTRA_CORRUPTIONS, TEST_CORRUPTIONS
 from sg.data.records import encode, val_image_id
-
-TEST_CORRUPTIONS = (
-    "gaussian_noise", "shot_noise", "impulse_noise",
-    "defocus_blur", "glass_blur", "motion_blur", "zoom_blur",
-    "snow", "frost", "fog", "brightness",
-    "contrast", "elastic_transform", "pixelate", "jpeg_compression",
-)
-EXTRA_CORRUPTIONS = ("speckle_noise", "gaussian_blur", "spatter", "saturate")
 KEEP = {c: {5} for c in TEST_CORRUPTIONS} | {c: {1, 2, 3, 4, 5} for c in EXTRA_CORRUPTIONS}
 
 VAL_H5 = "/scratch/gpfs/ZHUANGL/shared/imagenet-hdf5/val.h5"

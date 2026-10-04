@@ -19,6 +19,14 @@ from PIL import Image
 from sg.data.records import decode
 from sg.models.resnet import IMAGENET_MEAN, IMAGENET_STD
 
+TEST_CORRUPTIONS = (
+    "gaussian_noise", "shot_noise", "impulse_noise",
+    "defocus_blur", "glass_blur", "motion_blur", "zoom_blur",
+    "snow", "frost", "fog", "brightness",
+    "contrast", "elastic_transform", "pixelate", "jpeg_compression",
+)
+EXTRA_CORRUPTIONS = ("speckle_noise", "gaussian_blur", "spatter", "saturate")
+
 
 def shard_paths(root: str | Path, group: str) -> list[Path]:
     """group: 'imagenet_val' or e.g. 'imagenet_c/gaussian_noise/5'."""
@@ -36,12 +44,21 @@ def resize_center_crop(img: Image.Image, resize=256, crop=224) -> Image.Image:
     return img.crop((left, top, left + crop, top + crop))
 
 
-def preprocess(jpeg: bytes) -> np.ndarray:
+def load_uint8(jpeg: bytes) -> np.ndarray:
+    """Decode to a (224, 224, 3) uint8 image; clean val is resized and cropped."""
     img = Image.open(io.BytesIO(jpeg)).convert("RGB")
     if img.size != (224, 224):
         img = resize_center_crop(img)
-    x = np.asarray(img, np.float32) / 255.0
-    return (x - IMAGENET_MEAN) / IMAGENET_STD
+    return np.asarray(img, np.uint8)
+
+
+def normalize(x_uint8):
+    """uint8 NHWC -> normalized float32. Works on numpy or jax arrays."""
+    return (x_uint8 / 255.0 - IMAGENET_MEAN) / IMAGENET_STD
+
+
+def preprocess(jpeg: bytes) -> np.ndarray:
+    return normalize(load_uint8(jpeg).astype(np.float32))
 
 
 def read_group(root, group, keep=None, limit=None):

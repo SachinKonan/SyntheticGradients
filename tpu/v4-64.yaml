@@ -1,0 +1,30 @@
+# One job on a tpuswarm v4-64 pool worker (8 hosts, 32 chips, us-central2-b).
+# Submit with tpu/submit.sh, which fills CODE_URL, MODULE, ARGS.
+name: synthgrad
+resources:
+  cloud: gcp
+  region: us-central2
+  zone: us-central2-b
+  accelerators: tpu-v4-64
+  accelerator_args:
+    gcp_queued_resource: true
+    runtime_version: tpu-ubuntu2204-base
+  use_spot: true
+  disk_size: 300
+  job_recovery:
+    strategy: FAILOVER
+    max_restarts_on_errors: 0
+envs:
+  CODE_URL: ""
+  MODULE: ""
+  ARGS: ""
+run: |
+  set -euo pipefail
+  code="$HOME/synthgrad/code/$(basename "$CODE_URL" .tar.gz)"
+  if [ ! -d "$code" ]; then
+    mkdir -p "$code.tmp"
+    gcloud storage cp "$CODE_URL" "$code.tar.gz"
+    tar -xzf "$code.tar.gz" -C "$code.tmp"
+    mv "$code.tmp" "$code"
+  fi
+  exec bash "$code/tpu/run.sh" "$MODULE" $ARGS
