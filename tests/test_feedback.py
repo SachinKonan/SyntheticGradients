@@ -61,13 +61,24 @@ def test_exact_branch_reproduces_backprop(signals):
         assert_taps_equal(pred, deltas)
 
 
+def is_branch_tap(tap):
+    return tap.endswith(".bn1") or tap.endswith(".bn2")
+
+
 @pytest.mark.parametrize("exact_top", [0, 3, 7, N_BLOCKS - 1])
-def test_hybrid_taps_exact_down_to_start(signals, exact_top):
-    """Every tap of blocks >= n-1-exact_top is exact for every method, traced or not."""
+def test_hybrid_uses_exactly_what_it_pays_for(signals, exact_top):
+    """exact_top = k pays for the branch VJPs of the top k blocks. Then:
+    exact: residual taps of blocks >= n-1-k, branch taps of blocks >= n-k;
+    not exact: the branch taps of block n-1-k and everything below.
+    Holds for every method, traced or not."""
     params, stats, x_hats, block_io, stem, d_stream, deltas = signals
     names = [p for p, _, _ in resnet.blocks()]
     start = N_BLOCKS - 1 - exact_top
-    exact_taps = [t for t in feedback.all_taps() if t != "bn1" and names.index(block_of(t)) >= start]
+    idx = lambda t: names.index(block_of(t))
+    exact_taps = [t for t in feedback.all_taps() if t != "bn1" and (
+        idx(t) > start or (idx(t) == start and not is_branch_tap(t)))]
+    unpaid = [t for t in feedback.all_taps() if t != "bn1" and is_branch_tap(t) and idx(t) <= start]
+    assert f"{names[start]}.bn1" in unpaid and f"{names[start]}.bn2" in unpaid
     with jax.enable_x64(True):
         rec = f64(feedback.init_recurrence(jax.random.key(1)))
         rec = jax.tree.map(lambda a: a + 0.01, rec)  # nonzero U, V
@@ -76,9 +87,27 @@ def test_hybrid_taps_exact_down_to_start(signals, exact_top):
                 params, stats, x_hats, block_io, stem, d_stream, deltas, exact_top=k, **kw)
             pred = run(exact_top)
             assert_taps_equal(pred, deltas, exact_taps)
+            for t in unpaid:  # must not be the exact signal
+                rel = float(jnp.linalg.norm(pred[t] - deltas[t]) / jnp.linalg.norm(deltas[t]))
+                assert rel > 1e-3, (t, kw.keys(), rel)
             traced = jax.jit(run)(exact_top)
             for t in pred:
                 np.testing.assert_allclose(traced[t], pred[t], rtol=1e-8, atol=1e-30, err_msg=t)
+
+
+def test_exact_inputs_do_not_leak(signals):
+    """Predictions at k=0 must not change if every exact quantity except the seed
+    (d_stream[-1]) and the paid-for taps is replaced by garbage."""
+    params, stats, x_hats, block_io, stem, d_stream, deltas = signals
+    with jax.enable_x64(True):
+        rec = jax.tree.map(lambda a: a + 0.01, f64(feedback.init_recurrence(jax.random.key(1))))
+        junk_stream = [d * 7.0 + 1.0 for d in d_stream[:-1]] + [d_stream[-1]]
+        junk_deltas = {t: v * -3.0 + 2.0 for t, v in deltas.items()}
+        for kw in ({"branch_term": "none"}, {"rec": rec}):
+            a = feedback.backward_over_depth(params, stats, x_hats, block_io, stem, d_stream, deltas, **kw)
+            b = feedback.backward_over_depth(params, stats, x_hats, block_io, stem, junk_stream, junk_deltas, **kw)
+            for t in a:
+                np.testing.assert_allclose(a[t], b[t], rtol=1e-12, atol=1e-30, err_msg=t)
 
 
 def test_zero_heads_recurrence_equals_shortcut_only(signals):

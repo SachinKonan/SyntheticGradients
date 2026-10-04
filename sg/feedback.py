@@ -20,7 +20,9 @@ shortcut term exactly, and replaces the branch with one of:
                 correction U_l s_l for d_l, and heads V s for the branch taps
 
 Hybrid: with exact_top = k the top k blocks are backpropagated exactly (their
-branch taps are taken from the exact signals), and prediction starts below.
+branch taps are taken from the exact signals). That makes the error at the
+output of block n-1-k exact, so that block's residual taps are exact for free;
+its branch taps would need its own branch VJP, so they are predicted.
 
 DFA predicts each tap directly from the output error instead.
 """
@@ -165,7 +167,7 @@ def backward_over_depth(params, stats, x_hats, block_io, stem, d_exact, exact_de
     d_exact: exact dL/dh_out of every block (d_exact[-1] is the seed at the top
         of the residual stream). Only d_exact[n-1-exact_top] is used.
     exact_deltas: exact signals at every tap; supplies the branch taps of the
-        exactly backpropagated blocks when exact_top > 0.
+        exactly backpropagated blocks (indices > n-1-exact_top) only.
     exact_top: number of top blocks backpropagated exactly (may be traced).
     branch_term: "exact" | "none". rec: recurrence params.
     Returns {tap: delta}.
@@ -177,7 +179,8 @@ def backward_over_depth(params, stats, x_hats, block_io, stem, d_exact, exact_de
     for k in reversed(range(n)):
         pre, stride, projection = resnet.blocks()[k]
         h_in, h_out = block_io[k]
-        exact_here = k >= start
+        exact_here = k >= start      # the error at this block's output is exact
+        branch_paid = k > start      # this block's branch VJP was computed exactly
         d = d_exact[k] if d is None else jnp.where(exact_here, d_exact[k], d)
         g = jnp.where(h_out > 0, d, 0.0)
         out[f"{pre}.bn3"] = g
@@ -209,8 +212,8 @@ def backward_over_depth(params, stats, x_hats, block_io, stem, d_exact, exact_de
                 delta1 = scale * jnp.where(relu_mask(params, x_hats, b1), jnp.einsum("nhwr,rc->nhwc", s, r["V1"]), 0.0)
                 d_next = d_next + scale * jnp.einsum("nhwr,rc->nhwc", s, r["U"])
             if exact_deltas is not None:
-                delta1 = jnp.where(exact_here, exact_deltas[b1], delta1)
-                delta2 = jnp.where(exact_here, exact_deltas[b2], delta2)
+                delta1 = jnp.where(branch_paid, exact_deltas[b1], delta1)
+                delta2 = jnp.where(branch_paid, exact_deltas[b2], delta2)
             out[b1], out[b2] = delta1, delta2
         d = d_next
 
