@@ -25,7 +25,7 @@ sudo rm -f /tmp/libtpu_lockfile
 venv="$HOME/.venvs/synthgrad"
 [ -x "$venv/bin/python" ] || UV_NO_CONFIG=1 uv venv "$venv" --python 3.12
 UV_NO_CONFIG=1 uv pip install -q --python "$venv/bin/python" \
-  'jax==0.11.1' 'jaxlib==0.11.1' 'libtpu==0.0.46' numpy pillow array-record safetensors
+  'jax==0.11.1' 'jaxlib==0.11.1' 'libtpu==0.0.46' 'requests==2.32.5' numpy pillow array-record safetensors
 
 ips=$(printf '%s\n' "$SKYPILOT_NODE_IPS" | awk 'NF')
 coordinator="$(echo "$ips" | head -n1):8476"
