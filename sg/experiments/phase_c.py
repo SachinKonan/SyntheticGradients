@@ -46,6 +46,11 @@ sg_ = jax.lax.stop_gradient
 
 
 def load_predictor(url, params_np, cache):
+    """A saved predictor, or 'svd:<frac>' for the untrained low-rank backward (no pretraining)."""
+    if url.startswith("svd:"):
+        frac = float(url.removeprefix("svd:"))
+        return feedback.init_lowrank(params_np, frac), {"arch": "lowrank", "lowrank_frac": frac, "rank": 64,
+                                                         "config": "untrained (SVD of the real convs)"}
     meta = json.loads(Path(st.fetch_file(url.removesuffix(".npz") + ".json", cache)).read_text())
     arch = meta.get("arch", "recurrence")
     template = {"recurrence": lambda: feedback.init_recurrence(jax.random.key(0), meta.get("rank", 64)),
@@ -61,7 +66,8 @@ def cosine(a, b):
 def main():
     ap = argparse.ArgumentParser()
     st.add_launch_args(ap)
-    ap.add_argument("--predictor", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/lr4.npz")
+    ap.add_argument("--predictor", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/lr4.npz",
+                    help="saved predictor .npz (with .json), or svd:<frac> to start without pretraining")
     ap.add_argument("--exact-top", type=int, default=1, help="exact top blocks, at training and deployment")
     ap.add_argument("--init-mult", type=float, default=3.0, help="starting step multiplier (from deployment tuning)")
     ap.add_argument("--unroll", type=int, default=4, help="K adaptation steps per outer step")
