@@ -73,10 +73,12 @@ def method_names(exact_tops):
 # ----------------------------------------------------------------------------- losses
 
 def rec_loss(rec, params, stats, fwd, d_stream, exact_top, true, target):
-    """Loss of the predicted signals against the exact ones, over all 53 BNs."""
-    x_hats, block_io, stem = fwd
+    """Loss of the predicted signals against the exact ones, over all 53 BNs.
+    rec: any predictor (recurrence, GRU or low-rank); fwd = (x_hats, block_io, stem[, inv_stds])."""
+    x_hats, block_io, stem, *rest = fwd
+    kw = feedback.predictor_kwargs(rec, rest[0] if rest else None)
     pred = feedback.backward_over_depth(params, stats, x_hats, block_io, stem, d_stream, true,
-                                        exact_top=exact_top, rec=rec)
+                                        exact_top=exact_top, **kw)
     taps = feedback.all_taps()
     if target == "delta":
         per_tap = [jnp.sum(jnp.square(pred[t] - true[t])) / (jnp.sum(jnp.square(true[t])) + 1e-30) for t in taps]

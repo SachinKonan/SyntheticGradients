@@ -8,11 +8,14 @@ val ids; target: full-gradient cosine over all 53 BNs).
 
 Per predictor:
   schedule  k (exact top blocks shown to the predictor) at training step t:
-              k0         always 0
-              uniform    uniform over 0..15
-              cos{K}_{D} K * (1 + cos(pi * min(t / D passes, 1))) / 2, randomly
-                         rounded; D is in absolute passes, so one long run
-                         gives every training budget from its curve
+              k{N}             always N
+              uniform          uniform over 0..15
+              cos{K}_{D}       K * (1 + cos(pi * min(t / D epochs, 1))) / 2, randomly
+                               rounded; D is in absolute epochs, so one long run
+                               gives every training budget from its curve
+              cos{K}_{D}_to{F} the same, decaying from K to F instead of to 0
+  arch      --arch recurrence | gru | lowrank (--lowrank-frac; starts from the
+            SVD of the real convs), the same for every predictor in a job
             predictors with the same schedule share the same k draws
   batch     Tent batches per update: 32 streams x accumulation (1, 2, 4 steps)
   lr        Adam learning rate
@@ -53,13 +56,15 @@ K_MAX = len(resnet.blocks()) - 1
 # ----------------------------------------------------------------------------- schedules
 
 def k_value(schedule: str, t: int, steps_per_pass: int, rng) -> int:
-    if schedule == "k0":
-        return 0
     if schedule == "uniform":
         return int(rng.integers(0, K_MAX + 1))
-    k_start, passes = schedule.removeprefix("cos").split("_")
-    frac = min(t / (float(passes) * steps_per_pass), 1.0)
-    x = int(k_start) * 0.5 * (1 + np.cos(np.pi * frac))
+    if not schedule.startswith("cos"):
+        return int(schedule.removeprefix("k"))
+    parts = schedule.removeprefix("cos").split("_")
+    k_start, passes = int(parts[0]), float(parts[1])
+    k_end = int(parts[2].removeprefix("to")) if len(parts) > 2 else 0
+    frac = min(t / (passes * steps_per_pass), 1.0)
+    x = k_end + (k_start - k_end) * 0.5 * (1 + np.cos(np.pi * frac))
     return int(np.floor(x) + (rng.random() < x - np.floor(x)))  # random rounding
 
 
@@ -109,6 +114,8 @@ def main():
     p.add_argument("--accums", default="1,2,4", help="predictor batch = devices x accum Tent batches")
     p.add_argument("--rec-lrs", default="3e-4,1e-3,3e-3")
     p.add_argument("--rank", type=int, default=64)
+    p.add_argument("--arch", default="recurrence", choices=["recurrence", "gru", "lowrank"])
+    p.add_argument("--lowrank-frac", type=float, default=0.125)
     p.add_argument("--target", default="full_cos", choices=["delta", "tap_cos", "full_cos", "full_mse"])
     p.add_argument("--passes", type=int, default=16)
     p.add_argument("--eval-steps", type=int, default=25)
@@ -138,7 +145,8 @@ def main():
     for c in configs:
         c["predictor_batch"] = S * c["accum"]
     log(f"{jax.process_count()} hosts, {len(jax.devices())} devices, {S} streams, {NP} predictors: "
-        f"schedules {schedules} x accum {accums} x lr {rec_lrs}; rank {args.rank}, target {args.target}")
+        f"schedules {schedules} x accum {accums} x lr {rec_lrs}; arch {args.arch}, rank {args.rank}, "
+        f"lowrank-frac {args.lowrank_frac}, target {args.target}")
 
     cache = Path(args.local_cache)
     t0 = time.time()
@@ -159,11 +167,16 @@ def main():
     weights = st.fetch_file(args.weights, cache)
     log(f"data + weights ready in {time.time() - t0:.0f}s")
 
-    params, stats = sm.replicate(resnet.load_torchvision(weights))
+    params_np, stats_np = resnet.load_torchvision(weights)
+    params, stats = sm.replicate((params_np, stats_np))
     bn0 = tent.bn_params(params)
     tent_kw = dict(lr=args.lr, momentum=args.momentum)
 
-    rec_init = feedback.init_recurrence(jax.random.key(0), args.rank)  # same init for every predictor
+    rec_init = {  # same init for every predictor
+        "recurrence": lambda: feedback.init_recurrence(jax.random.key(0), args.rank),
+        "gru": lambda: feedback.init_gru(jax.random.key(0), args.rank),
+        "lowrank": lambda: feedback.init_lowrank(params_np, args.lowrank_frac),
+    }[args.arch]()
     stack = lambda t: jax.tree.map(lambda a: np.broadcast_to(np.asarray(a), (NP,) + np.shape(a)).copy(), t)
     state = {"recs": stack(rec_init), "opt": {"t": np.zeros((NP,), np.int32), "m": stack(jax.tree.map(np.zeros_like, rec_init)),
                                                "v": stack(jax.tree.map(np.zeros_like, rec_init))},
@@ -195,9 +208,9 @@ def main():
         """Exact signals for every stream (vmapped), and the exact Tent update."""
         def one(bn_s, x_s):
             ps = {**params, **bn_s}
-            _, true, d_stream, x_hats, block_io, stem, _, _ = feedback.exact_signals(
+            _, true, d_stream, x_hats, block_io, stem, _, inv_stds = feedback.exact_signals(
                 ps, stats, imagenet.normalize(x_s), tent.entropy)
-            return ps, true, d_stream, x_hats, block_io, stem
+            return ps, true, d_stream, x_hats, block_io, stem, inv_stds
         return jax.vmap(one)(bn, x_uint8)
 
     def tent_update(bn, velocity, true, x_hats):
@@ -207,17 +220,16 @@ def main():
     # ---------------------------------------------------------------- train step
     @functools.partial(jax.jit, donate_argnums=(0, 1, 4), out_shardings=(sm.shard, sm.shard, sm.repl, sm.repl))
     def train_step(bn, velocity, x, ks, state, apply):
-        ps, true, d_stream, x_hats, block_io, stem = exact_all(bn, x)
-        sg_ = jax.lax.stop_gradient
-        ps, true, d_stream, x_hats, block_io, stem = map(sg_, (ps, true, d_stream, x_hats, block_io, stem))
+        sig = jax.lax.stop_gradient(exact_all(bn, x))
+        ps, true, d_stream, x_hats, block_io, stem, inv_stds = sig
 
         def per_predictor(args_):
             rec, k = args_
-            def per_stream(ps_s, true_s, d_s, xh_s, io_s, stem_s):
+            def per_stream(ps_s, true_s, d_s, xh_s, io_s, stem_s, inv_s):
                 (loss, _), g = jax.value_and_grad(rec_loss, has_aux=True)(
-                    rec, ps_s, stats, (xh_s, io_s, stem_s), d_s, k, true_s, args.target)
+                    rec, ps_s, stats, (xh_s, io_s, stem_s, inv_s), d_s, k, true_s, args.target)
                 return loss, g
-            loss, g = jax.vmap(per_stream)(ps, true, d_stream, x_hats, block_io, stem)
+            loss, g = jax.vmap(per_stream)(*sig)
             return loss.mean(), jax.tree.map(lambda a: a.mean(0), g)
 
         losses, grads = jax.lax.map(per_predictor, (state["recs"], ks))
@@ -231,16 +243,17 @@ def main():
     # ---------------------------------------------------------------- eval step
     @functools.partial(jax.jit, donate_argnums=(0, 1, 2, 3), out_shardings=(sm.shard, sm.shard, pred_shard, sm.shard))
     def eval_step(bn, velocity, acc, acc_sc, x, recs):
-        ps, true, d_stream, x_hats, block_io, stem = exact_all(bn, x)
+        sig = exact_all(bn, x)
+        ps, true, d_stream, x_hats, block_io, stem, inv_stds = sig
 
-        def full(rec_or_none, ps_s, true_s, d_s, xh_s, io_s, stem_s):
+        def full(rec_or_none, ps_s, true_s, d_s, xh_s, io_s, stem_s, inv_s):
             back = functools.partial(feedback.backward_over_depth, ps_s, stats, xh_s, io_s, stem_s, d_s, true_s)
-            return jnp.stack([feedback.compare(back(exact_top=k, rec=rec_or_none), true_s, xh_s)[1]
+            kw = {} if rec_or_none is None else feedback.predictor_kwargs(rec_or_none, inv_s)
+            return jnp.stack([feedback.compare(back(exact_top=k, **kw), true_s, xh_s)[1]
                               for k in eval_tops])  # (K, 2)
 
-        per_pred = jax.lax.map(lambda rec: jax.vmap(functools.partial(full, rec))(
-            ps, true, d_stream, x_hats, block_io, stem), recs)      # (NP, S, K, 2)
-        shortcut = jax.vmap(functools.partial(full, None))(ps, true, d_stream, x_hats, block_io, stem)
+        per_pred = jax.lax.map(lambda rec: jax.vmap(functools.partial(full, rec))(*sig), recs)  # (NP, S, K, 2)
+        shortcut = jax.vmap(functools.partial(full, None))(*sig)
         bn, velocity = tent_update(bn, velocity, true, x_hats)
         return bn, velocity, acc + per_pred, acc_sc + shortcut
 

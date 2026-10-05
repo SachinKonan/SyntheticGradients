@@ -55,8 +55,10 @@ def main():
         j, rank, out = int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
         arrays = {k: v[j] for k, v in stacked.items()}
         results = json.loads(read(f"{run}/results.json"))
-        meta = {"kind": "recurrence", "rank": rank, "source": run, "index": j, "config": results["predictors"][j]}
-        assert arrays["['A']"].shape == (rank, rank), arrays["['A']"].shape
+        cfg = results["config"]
+        meta = {"kind": "predictor", "arch": cfg.get("arch", "recurrence"), "rank": cfg.get("rank", rank),
+                "lowrank_frac": cfg.get("lowrank_frac"), "source": run, "index": j,
+                "config": results["predictors"][j]}
     else:
         out = sys.argv[3]
         prefix = "['dfa_fit']['"

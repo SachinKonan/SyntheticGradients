@@ -17,7 +17,9 @@ shortcut term exactly, and replaces the branch with one of:
   "exact"       the true VJP, including the branch taps (a correctness check)
   "none"        nothing: shortcut-only feedback, branch taps get no signal
   a recurrence  a low-rank state s carried down the depth: a learned
-                correction U_l s_l for d_l, and heads V s for the branch taps
+                correction U_l s_l for d_l, and heads V s for the branch taps;
+                the state update is either a gated linear cell (init_recurrence)
+                or a convolution-free GRU cell (init_gru), shared across depth
   low-rank      the true branch backward (exact ReLU masks and BN backward)
                 with each conv replaced by a rank-r factorization, initialized
                 from the SVD of the real weights; full rank is exact
@@ -133,6 +135,32 @@ def init_recurrence(key, rank=64, mix=True):
     }
 
 
+def init_gru(key, rank=64, mix=True):
+    """Like init_recurrence, but the shared state update is a GRU cell on [s, x_l],
+    x_l = C_l a_l + e_l. Same per-block inputs and outputs, so only the cell differs."""
+    rec = init_recurrence(key, rank, mix)
+    k_z, k_r, k_h = jax.random.split(jax.random.fold_in(key, 1), 3)
+    normal = lambda k: jax.random.normal(k, (2 * rank, rank), jnp.float32) / np.sqrt(2 * rank)
+    del rec["A"], rec["B"]
+    rec["gru"] = {"Wz": normal(k_z), "bz": jnp.full((rank,), -2.0),  # start mostly keeping s
+                  "Wr": normal(k_r), "br": jnp.zeros((rank,)),
+                  "Wh": normal(k_h), "bh": jnp.zeros((rank,))}
+    return rec
+
+
+def _cell(rec, s, x_in):
+    """One step of the state update down the depth."""
+    if "gru" in rec:
+        g = rec["gru"]
+        sx = jnp.concatenate([s, x_in], axis=-1)
+        z = jax.nn.sigmoid(jnp.einsum("nhwi,ir->nhwr", sx, g["Wz"]) + g["bz"])
+        r = jax.nn.sigmoid(jnp.einsum("nhwi,ir->nhwr", sx, g["Wr"]) + g["br"])
+        h = jnp.tanh(jnp.einsum("nhwi,ir->nhwr", jnp.concatenate([r * s, x_in], axis=-1), g["Wh"]) + g["bh"])
+        return (1 - z) * s + z * h
+    gate = jax.nn.silu(x_in)
+    return s + jnp.einsum("nhwr,rq->nhwq", gate * jnp.einsum("nhwr,rq->nhwq", s, rec["A"]), rec["B"])
+
+
 def block_in_widths():
     return [_block_in_width(pre) for pre, _, _ in resnet.blocks()]
 
@@ -242,6 +270,15 @@ def init_lowrank(params, frac):
     return {"blocks": blocks}
 
 
+def is_lowrank(pred) -> bool:
+    return "c1" in pred["blocks"][0]
+
+
+def predictor_kwargs(pred, inv_stds):
+    """backward_over_depth keywords for a trained predictor of any kind."""
+    return {"lowrank": pred, "inv_stds": inv_stds} if is_lowrank(pred) else {"rec": pred}
+
+
 def _bn_backward(params, x_hats, inv_stds, name, dy):
     """dL/dx of a batch-statistics BN given dL/dy (exact, cheap)."""
     x_hat, mean = x_hats[name], lambda a: jnp.mean(a, axis=(0, 1, 2))
@@ -333,8 +370,7 @@ def backward_over_depth(params, stats, x_hats, block_io, stem, d_exact, exact_de
                 delta2 = scale * jnp.where(relu_mask(params, x_hats, b2), jnp.einsum("nhwr,rc->nhwc", s, r["V2"]), 0.0)
                 s = _upsample(s, stride)
                 a = h_in * jax.lax.rsqrt(jnp.mean(jnp.square(h_in), axis=-1, keepdims=True) + 1e-6)
-                gate = jax.nn.silu(jnp.einsum("nhwc,cr->nhwr", a, r["C"]) + r["e"])
-                s = s + jnp.einsum("nhwr,rq->nhwq", gate * jnp.einsum("nhwr,rq->nhwq", s, rec["A"]), rec["B"])
+                s = _cell(rec, s, jnp.einsum("nhwc,cr->nhwr", a, r["C"]) + r["e"])
                 if "mix" in r:
                     s = s + _depthwise3x3(s, r["mix"])
                 delta1 = scale * jnp.where(relu_mask(params, x_hats, b1), jnp.einsum("nhwr,rc->nhwc", s, r["V1"]), 0.0)

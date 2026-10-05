@@ -206,3 +206,18 @@ def test_lowrank_rank_trends(signals):
         assert scores[0] > cos(back(branch_term="none")), scores
     costs = [feedback.lowrank_cost(f) for f in (1 / 16, 1 / 4, 1.0)]
     assert costs[0] < costs[1] < costs[2]
+
+
+def test_gru_runs_and_starts_as_shortcut(signals):
+    """Zero output heads: the GRU predictor equals shortcut-only, like the linear cell."""
+    params, stats, x_hats, block_io, stem, d_stream, _ = signals
+    with jax.enable_x64(True):
+        gru = f64(feedback.init_gru(jax.random.key(3)))
+        assert "A" not in gru and "gru" in gru
+        a = feedback.backward_over_depth(params, stats, x_hats, block_io, stem, d_stream, rec=gru)
+        b = feedback.backward_over_depth(params, stats, x_hats, block_io, stem, d_stream, branch_term="none")
+        for tap in a:
+            np.testing.assert_allclose(a[tap], b[tap], rtol=1e-12, err_msg=tap)
+        gru = jax.tree.map(lambda v: v + 0.01, gru)
+        c = feedback.backward_over_depth(params, stats, x_hats, block_io, stem, d_stream, rec=gru)
+        assert all(bool(jnp.isfinite(v).all()) for v in c.values())

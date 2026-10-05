@@ -8,7 +8,9 @@ Methods differ only in where the BN gradient comes from:
   tent          exact backprop
   shortcut@k    exact top k blocks, then the shortcut path only
   dfa           one fitted projection of the logit error per BN
-  <name>@k      exact top k blocks, then a trained predictor (--predictors)
+  lowrank{f}@k  exact top k blocks, then the untrained low-rank backward (rank f x width)
+  <name>@k      exact top k blocks, then a trained predictor (--predictors; recurrence,
+                GRU or low-rank, read from the .json saved next to each .npz)
 
 plus two references without gradients: no_adapt (running BN statistics) and
 bn_adapt (test-batch statistics, no update).
@@ -50,16 +52,16 @@ def load_npz(url, cache):
 
 
 def method_deltas(method, rec, dfa_w, p, stats, sig):
-    """BN error signals for one method from the exact signals `sig` (only what it pays for is used)."""
-    logits, true, d_stream, x_hats, block_io, stem, e, _ = sig
+    """BN error signals for one method from the exact signals `sig` (only what it pays for is used).
+    rec: the method's predictor (recurrence, GRU or low-rank factors), or None."""
     if method == "tent":
-        return true
+        return sig.deltas
     if method == "dfa":
-        return feedback.dfa_predict(dfa_w, e, feedback.tap_masks(p, x_hats, block_io, stem))
-    name, k = method.split("@")
-    back = functools.partial(feedback.backward_over_depth, p, stats, x_hats, block_io, stem, d_stream, true,
-                             exact_top=int(k))
-    return back() if name == "shortcut" else back(rec=rec)
+        return feedback.dfa_predict(dfa_w, sig.e, feedback.tap_masks(p, sig.x_hats, sig.block_io, sig.stem))
+    k = int(method.split("@")[1])
+    back = functools.partial(feedback.backward_over_depth, p, stats, sig.x_hats, sig.block_io, sig.stem,
+                             sig.d_stream, sig.deltas, exact_top=k)
+    return back() if rec is None else back(**feedback.predictor_kwargs(rec, sig.inv_stds))
 
 
 def main():
@@ -98,11 +100,21 @@ def main():
     params, stats = sm.replicate(resnet.load_torchvision(st.fetch_file(args.weights, cache)))
     bn0 = tent.bn_params(params)
 
-    template = feedback.init_recurrence(jax.random.key(0), args.rank)
+    params_np = resnet.load_torchvision(st.fetch_file(args.weights, cache))[0]
     recs = {}
-    for item in args.predictors.split(","):
+    for item in filter(None, args.predictors.split(",")):
         name, url = item.split("=")
+        meta = json.loads(Path(st.fetch_file(url.removesuffix(".npz") + ".json", cache)).read_text())
+        arch = meta.get("arch", "recurrence")
+        template = {"recurrence": lambda: feedback.init_recurrence(jax.random.key(0), meta.get("rank", args.rank)),
+                    "gru": lambda: feedback.init_gru(jax.random.key(0), meta.get("rank", args.rank)),
+                    "lowrank": lambda: feedback.init_lowrank(params_np, meta["lowrank_frac"])}[arch]()
         recs[name] = sm.replicate(unflatten(template, load_npz(url, cache)))
+        log(f"predictor {name}: {arch} {meta.get('config')}")
+    for m in methods:  # untrained low-rank backward, from the SVD of the real convs
+        name = m.split("@")[0]
+        if name.startswith("lowrank") and name not in recs:
+            recs[name] = sm.replicate(feedback.init_lowrank(params_np, float(name.removeprefix("lowrank"))))
     dfa_w = sm.replicate(load_npz(args.dfa, cache))
 
     num_steps = st.common_steps(streams)
