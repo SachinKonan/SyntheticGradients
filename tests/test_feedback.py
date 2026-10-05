@@ -252,3 +252,22 @@ def test_phase_c_gradient_only_reaches_the_predictor(signals):
         # ResNet's convolutions get a gradient only through the final forward (first order), which
         # we never apply; the predictor path itself must not depend on them.
         assert all(bool(jnp.isfinite(v).all()) for v in jax.tree.leaves(g_params))
+
+
+def test_fetch_file_cache_keys_on_full_path(tmp_path):
+    from sg.experiments import streams as st
+    import subprocess
+    calls = []
+    real = subprocess.run
+    def fake_run(cmd, check=True, **kw):
+        calls.append(cmd)
+        open(cmd[-1], "wb").write(cmd[-2].encode())
+    subprocess.run = fake_run
+    try:
+        a = st.fetch_file("gs://b/runs/one/predictor.npz", tmp_path)
+        b = st.fetch_file("gs://b/runs/two/predictor.npz", tmp_path)
+        assert a != b and open(a, "rb").read() != open(b, "rb").read()
+        st.fetch_file("gs://b/runs/one/predictor.npz", tmp_path)
+        assert len(calls) == 2  # cached by full path
+    finally:
+        subprocess.run = real

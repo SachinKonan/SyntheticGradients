@@ -34,10 +34,12 @@ def fetch(root: str, rel: str, cache: Path) -> Path:
 
 
 def fetch_file(url: str, cache: Path) -> str:
+    """Local copy of a gs:// file, cached by its full path (different runs reuse file names)."""
     if not url.startswith("gs://"):
         return url
     cache.mkdir(parents=True, exist_ok=True)
-    local = cache / Path(url).name
+    local = cache / "files" / url.removeprefix("gs://")
+    local.parent.mkdir(parents=True, exist_ok=True)
     if not local.exists():
         subprocess.run(["gcloud", "storage", "cp", url, str(local)], check=True)
     return str(local)
