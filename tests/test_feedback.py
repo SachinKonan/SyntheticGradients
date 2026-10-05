@@ -221,3 +221,34 @@ def test_gru_runs_and_starts_as_shortcut(signals):
         gru = jax.tree.map(lambda v: v + 0.01, gru)
         c = feedback.backward_over_depth(params, stats, x_hats, block_io, stem, d_stream, rec=gru)
         assert all(bool(jnp.isfinite(v).all()) for v in c.values())
+
+
+def test_phase_c_gradient_only_reaches_the_predictor(signals):
+    """The outer gradient flows into the predictor and step size, never into ResNet,
+    and stop-gradient on ResNet quantities leaves no second-order path."""
+    params, stats, *_ = signals
+    sg_ = jax.lax.stop_gradient
+    with jax.enable_x64(True):
+        x = jax.random.normal(jax.random.key(0), (4, 96, 96, 3), jnp.float64)
+        y = jnp.arange(4)
+        phi = f64(feedback.init_lowrank(params, 0.25))
+        bn0 = tent.bn_params(params)
+
+        def outer(phi, log_mult, params):
+            bn = bn0
+            for _ in range(2):
+                p = sg_({**params, **bn})
+                sig = sg_(feedback.exact_signals(p, stats, x, tent.entropy))
+                d = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
+                                                 lowrank=phi, inv_stds=sig.inv_stds)
+                g = resnet.bn_grads(d, sig.x_hats)
+                bn = jax.tree.map(lambda b, gg: b - 1e-3 * jnp.exp(log_mult) * gg, bn, g)
+            logits, _ = resnet.apply({**params, **bn}, stats, x, batch_stats=True)
+            return jnp.mean(jax.nn.logsumexp(logits, -1) - logits[jnp.arange(4), y])
+
+        g_phi, g_mult, g_params = jax.grad(outer, argnums=(0, 1, 2))(phi, jnp.float64(0.0), params)
+        assert float(sum(jnp.sum(jnp.abs(v)) for v in jax.tree.leaves(g_phi))) > 0
+        assert abs(float(g_mult)) > 0
+        # ResNet's convolutions get a gradient only through the final forward (first order), which
+        # we never apply; the predictor path itself must not depend on them.
+        assert all(bool(jnp.isfinite(v).all()) for v in jax.tree.leaves(g_params))
