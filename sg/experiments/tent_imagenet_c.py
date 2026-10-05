@@ -73,8 +73,8 @@ def main():
 
     cache = Path(args.local_cache)
     t0 = time.time()
-    streams = [st.Stream(st.fetch(args.data_root, specs[s][0], cache), specs[s][1], args.batch)
-               for s in sm.local_ids]
+    streams = [st.Stream(st.fetch(args.data_root, specs[s][0], cache), specs[s][1], args.batch,
+                         resize=imagenet.needs_resize(specs[s][0])) for s in sm.local_ids]
     weights = st.fetch_file(args.weights, cache)
     log(f"data + weights ready in {time.time() - t0:.0f}s")
 

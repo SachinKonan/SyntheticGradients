@@ -82,7 +82,9 @@ def rec_loss(rec, params, stats, fwd, d_stream, exact_top, true, target):
         per_tap = [jnp.sum(jnp.square(pred[t] - true[t])) / (jnp.sum(jnp.square(true[t])) + 1e-30) for t in taps]
         return jnp.mean(jnp.stack(per_tap)), pred
     gp, gt = feedback.tap_grads(pred, x_hats), feedback.tap_grads(true, x_hats)
-    cos = lambda a, b: jnp.dot(a, b) / (jnp.linalg.norm(a) * jnp.linalg.norm(b) + 1e-30)
+    # jnp.linalg.norm has a NaN gradient at 0 (heads start at zero), so use a safe norm.
+    norm = lambda a: jnp.sqrt(jnp.sum(jnp.square(a)) + 1e-36)
+    cos = lambda a, b: jnp.dot(a, b) / (norm(a) * norm(b))
     if target == "tap_cos":
         return jnp.mean(jnp.stack([1 - cos(gp[t], gt[t]) for t in taps])), pred
     gp, gt = jnp.concatenate([gp[t] for t in taps]), jnp.concatenate([gt[t] for t in taps])
@@ -99,7 +101,8 @@ def fit_stream(bn, velocity, dfa_acc, x_uint8, y, exact_top, params, stats, rec,
         p, stats, imagenet.normalize(x_uint8), tent.entropy)
     (loss, pred), grad = jax.value_and_grad(rec_loss, has_aux=True)(
         rec, p, stats, (x_hats, block_io, stem), d_stream, exact_top, true, target)
-    dfa_acc = jax.tree.map(jnp.add, dfa_acc, feedback.dfa_stats(e, true))
+    masks = feedback.tap_masks(p, x_hats, block_io, stem)
+    dfa_acc = jax.tree.map(jnp.add, dfa_acc, feedback.dfa_stats(e, true, masks))
     _, full = feedback.compare(pred, true, x_hats)
     bn, velocity = tent.sgd_momentum(bn, resnet.bn_grads(true, x_hats), velocity, lr, momentum)
     return bn, velocity, dfa_acc, loss, grad, full, jnp.sum(logits.argmax(-1) == y)
@@ -132,7 +135,9 @@ def test_stream(bn, velocity, acc, x_uint8, y, quarter, params, stats, rec, w_fi
 
 def adam(params, grads, state, lr, b1=0.9, b2=0.999, eps=1e-8, clip=1.0):
     norm = jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree.leaves(grads)))
-    grads = jax.tree.map(lambda g: g * jnp.minimum(1.0, clip / (norm + 1e-12)), grads)
+    # A non-finite gradient would poison every parameter through the global clip; skip it.
+    ok = jnp.isfinite(norm)
+    grads = jax.tree.map(lambda g: jnp.where(ok, g * jnp.minimum(1.0, clip / (norm + 1e-12)), 0.0), grads)
     t = state["t"] + 1
     m = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g, state["m"], grads)
     v = jax.tree.map(lambda v, g: b2 * v + (1 - b2) * g * g, state["v"], grads)
@@ -177,10 +182,13 @@ def main():
 
     cache = Path(args.local_cache)
     t0 = time.time()
-    fit = [st.Stream(st.fetch(args.data_root, fspecs[s][0], cache), fspecs[s][1], args.batch, fit_ids)
-           for s in sm.local_ids]
-    test = [st.Stream(st.fetch(args.data_root, tspecs[s][0], cache), tspecs[s][1], args.batch, test_ids)
-            for s in sm.local_ids]
+    def stream(spec, keep):
+        group, order = spec
+        return st.Stream(st.fetch(args.data_root, group, cache), order, args.batch, keep,
+                         resize=imagenet.needs_resize(group))
+
+    fit = [stream(fspecs[s], fit_ids) for s in sm.local_ids]
+    test = [stream(tspecs[s], test_ids) for s in sm.local_ids]
     weights = st.fetch_file(args.weights, cache)
     log(f"data + weights ready in {time.time() - t0:.0f}s")
 
@@ -210,8 +218,9 @@ def main():
         info = {"loss": loss.mean(), "grad_norm": gnorm, "full_cos": full[:, 0].mean(), "correct": correct.sum()}
         return bn, velocity, dfa_acc, rec, opt, info
 
+    tap_shapes = _tap_shapes(args.batch)
     dfa_shapes = jax.eval_shape(feedback.dfa_stats, jax.ShapeDtypeStruct((args.batch, 1000), jnp.float32),
-                                _tap_shapes(args.batch))
+                                tap_shapes, {t: jax.ShapeDtypeStruct(sd.shape, bool) for t, sd in tap_shapes.items()})
     zero_dfa_acc = jax.jit(lambda: jax.tree.map(lambda sd: jnp.zeros((S,) + sd.shape, sd.dtype), dfa_shapes),
                            out_shardings=sm.shard)
     dfa_acc = zero_dfa_acc()
@@ -320,9 +329,10 @@ def write_results(args, specs, taps, methods, exact_tops, acc, curve, steps):
     def mean_over(arr, mask, q=None):
         """Mean over steps within each stream, then over the selected streams."""
         qs = slice(None) if q is None else slice(q, q + 1)
-        cnt = np.maximum(acc["count"][mask][:, qs].sum(1), 1)
+        cnt = acc["count"][mask][:, qs].sum(1)
         x = arr[mask][:, qs].sum(1)
-        return (x / cnt.reshape((-1,) + (1,) * (x.ndim - 1))).mean(0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            return (x / cnt.reshape((-1,) + (1,) * (x.ndim - 1))).mean(0)  # NaN where no steps
 
     def per_tap_table(mask):
         x = mean_over(acc["scores"], mask)                           # (M, T, K)
@@ -333,9 +343,10 @@ def write_results(args, specs, taps, methods, exact_tops, acc, curve, steps):
         x = mean_over(acc["full"], mask, q)                           # (M, 2)
         return {m: {"cos": float(x[i, 0]), "ratio": float(x[i, 1])} for i, m in enumerate(methods)}
 
-    flops = feedback.branch_flops()
-    n = len(flops)
-    cost = {k: float(flops[n - k:].sum() / flops.sum()) if k else 0.0 for k in exact_tops}
+    mix = not args.no_mix
+    cost = {"dfa": feedback.method_cost("dfa", 0),
+            **{f"shortcut@{k}": feedback.method_cost("shortcut", k) for k in exact_tops},
+            **{f"recurrence@{k}": feedback.method_cost("recurrence", k, args.rank, mix) for k in exact_tops}}
 
     gnorm2 = acc["gnorm2"][corrupt].sum(0)
     share = gnorm2 / gnorm2.sum()
@@ -351,7 +362,7 @@ def write_results(args, specs, taps, methods, exact_tops, acc, curve, steps):
 
     result = {
         "config": vars(args), "taps": taps, "methods": methods, "metrics": METRICS,
-        "exact_top_cost_fraction": cost,
+        "cost_fraction_of_exact_backward": cost,
         "full_corrupt": full_table(corrupt), "full_clean": full_table(clean) if clean.any() else None,
         "full_corrupt_by_quarter": [full_table(corrupt, q) for q in range(QUARTERS)],
         "per_tap_corrupt": per_tap_table(corrupt),
@@ -360,18 +371,20 @@ def write_results(args, specs, taps, methods, exact_tops, acc, curve, steps):
     }
     fc = result["full_corrupt"]
     print(f"FULL-GRADIENT COSINE (corrupt), target={args.target} rank={args.rank}", flush=True)
-    print(f"  dfa_random {fc['dfa_random']['cos']:.3f}   dfa_fit {fc['dfa_fit']['cos']:.3f}", flush=True)
-    print(f"  {'exact top k':>12s} {'cost':>6s} {'shortcut':>9s} {'recurrence':>11s}", flush=True)
+    print(f"  dfa_random {fc['dfa_random']['cos']:.3f}   dfa_fit {fc['dfa_fit']['cos']:.3f}"
+          f"   (cost {cost['dfa']:.3f} of the exact backward)", flush=True)
+    print(f"  {'exact top k':>12s} {'shortcut':>9s} {'cost':>6s} {'recurrence':>11s} {'cost':>6s}", flush=True)
     for k in exact_tops:
-        print(f"  {k:12d} {cost[k]:6.2f} {fc[f'shortcut@{k}']['cos']:9.3f} {fc[f'recurrence@{k}']['cos']:11.3f}",
-              flush=True)
+        print(f"  {k:12d} {fc[f'shortcut@{k}']['cos']:9.3f} {cost[f'shortcut@{k}']:6.2f}"
+              f" {fc[f'recurrence@{k}']['cos']:11.3f} {cost[f'recurrence@{k}']:6.2f}", flush=True)
     print(f"residual taps hold {100 * residual_share:.1f}% of the true BN gradient norm^2", flush=True)
-    print("per-stage cos_grad (recurrence@0 | shortcut@0), mean over taps:", flush=True)
+    k0 = min(exact_tops)
+    print(f"per-stage cos_grad (recurrence@{k0} | shortcut@{k0}), mean over taps:", flush=True)
     pt = result["per_tap_corrupt"]
     for stage in ("bn1", "layer1", "layer2", "layer3", "layer4"):
         ts = [t for t in taps if t == stage or t.startswith(stage + ".")]
-        r = np.mean([pt["recurrence@0"][t]["cos_grad"] for t in ts])
-        sc = np.mean([pt["shortcut@0"][t]["cos_grad"] for t in ts])
+        r = np.mean([pt[f"recurrence@{k0}"][t]["cos_grad"] for t in ts])
+        sc = np.mean([pt[f"shortcut@{k0}"][t]["cos_grad"] for t in ts])
         print(f"  {stage:7s} {r:.3f} | {sc:.3f}", flush=True)
     st.write_output(args.out, "results.json", json.dumps(result, indent=1).encode())
 

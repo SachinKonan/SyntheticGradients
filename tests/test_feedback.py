@@ -135,7 +135,7 @@ def test_dfa_fit_recovers_a_linear_map():
     W = feedback.dfa_random(jax.random.key(3))
     masks = {t: jnp.ones((4000, 1, 1, 1), bool) for t in feedback.all_taps()}
     deltas = feedback.dfa_predict(W, e, masks)
-    fit = feedback.dfa_solve(feedback.dfa_stats(e, deltas), ridge=1e-8)
+    fit = feedback.dfa_solve(feedback.dfa_stats(e, deltas, masks), ridge=1e-8)
     for tap in ["bn1", "layer1.0.bn1", "layer4.2.bn3"]:
         np.testing.assert_allclose(fit[tap], W[tap], rtol=1e-3, atol=1e-3)
 
@@ -151,3 +151,30 @@ def test_tap_widths_match_model(signals):
 def test_branch_flops_match_resnet50():
     # ResNet-50 is ~4.1 GMACs; stem + head are ~0.12 G, projections ~0.27 G.
     assert 3.5e9 < feedback.branch_flops().sum() < 3.9e9
+
+
+def test_cost_model():
+    br, pr = feedback.branch_flops(), feedback.projection_flops()
+    assert 0.3e9 < pr.sum() < 0.4e9  # four 1x1 projection convs
+    # Exact top 15 of 16 blocks with shortcut-only: everything except block 0's branch.
+    assert np.isclose(feedback.method_cost("shortcut", 15), 1 - br[0] / (br.sum() + pr.sum()))
+    # Shortcut-only still pays every projection VJP.
+    assert np.isclose(feedback.method_cost("shortcut", 0), pr.sum() / (br.sum() + pr.sum()))
+    # The recurrence costs more than shortcut-only at every k, and more at higher rank.
+    for k in (0, 4, 12):
+        r64, r256 = feedback.method_cost("recurrence", k, 64), feedback.method_cost("recurrence", k, 256)
+        assert feedback.method_cost("shortcut", k) < r64 < r256
+    assert feedback.method_cost("dfa", 0) < 0.02
+
+
+def test_nan_safe_cosine_loss(signals):
+    """The cosine targets must give finite gradients when heads start at zero."""
+    from sg.experiments import gate2_predictability as g2
+    params, stats, x_hats, block_io, stem, d_stream, deltas = signals
+    with jax.enable_x64(True):
+        rec = f64(feedback.init_recurrence(jax.random.key(1)))
+        for target in ("tap_cos", "full_cos", "full_mse", "delta"):
+            for k in (0, 3, 14):
+                (_, _), grad = jax.value_and_grad(g2.rec_loss, has_aux=True)(
+                    rec, params, stats, (x_hats, block_io, stem), d_stream, k, deltas, target)
+                assert all(bool(jnp.isfinite(g).all()) for g in jax.tree.leaves(grad)), (target, k)

@@ -140,6 +140,53 @@ def branch_flops(image=224):
     return np.array(flops, np.float64)
 
 
+def projection_flops(image=224):
+    """Multiply-adds of each block's shortcut-projection VJP (0 for identity shortcuts).
+    Every predictor runs these: the shortcut path is kept exact."""
+    flops, h = [], image // 4
+    for (pre, stride, projection), c_in, c_out in zip(resnet.blocks(), block_in_widths(), block_out_widths()):
+        ho = h // stride
+        flops.append(ho * ho * c_in * c_out if projection else 0)
+        h = ho
+    return np.array(flops, np.float64)
+
+
+def recurrence_flops(rank, mix=True, image=224):
+    """Multiply-adds of the recurrence step in each block (excluding the one-off seed)."""
+    flops, h = [], image // 4
+    for (pre, stride, _), c_in, c_out in zip(resnet.blocks(), block_in_widths(), block_out_widths()):
+        mid, ho = c_out // resnet.EXPANSION, h // stride
+        per_in = c_in * rank + 2 * rank * rank + rank * c_in + rank * mid + (9 * rank if mix else 0)  # C, A, B, U, V1, mix
+        flops.append(h * h * per_in + ho * ho * rank * mid)                                          # + V2
+        h = ho
+    return np.array(flops, np.float64)
+
+
+def seed_flops(rank, image=224):
+    """Multiply-adds to seed the state from the exact error at each block's output (R)."""
+    flops, h = [], image // 4
+    for (pre, stride, _), c_out in zip(resnet.blocks(), block_out_widths()):
+        ho = h // stride
+        flops.append(ho * ho * c_out * rank)
+        h = ho
+    return np.array(flops, np.float64)
+
+
+def method_cost(method, exact_top, rank=None, mix=True):
+    """Error-propagation cost relative to the exact backward (all branch VJPs and
+    projection VJPs). method: 'shortcut' | 'recurrence' | 'dfa'."""
+    branch, proj = branch_flops(), projection_flops()
+    total = branch.sum() + proj.sum()
+    n = len(branch)
+    start = n - 1 - exact_top
+    if method == "dfa":  # one (1000 x C) projection of the logit error per tap, per image
+        return float(sum(tap_widths().values()) * 1000 / total)
+    cost = branch[start + 1:].sum() + proj.sum()
+    if method == "recurrence":
+        cost += recurrence_flops(rank, mix)[: start + 1].sum() + seed_flops(rank)[start]
+    return float(cost / total)
+
+
 def _block_in_width(pre):
     stage, b = pre.split(".")
     stage_idx = int(stage[-1]) - 1
@@ -244,13 +291,15 @@ def dfa_predict(W, e, masks):
             for tap in all_taps()}
 
 
-def dfa_stats(e, deltas):
-    """Sufficient statistics for a ridge fit of mean_hw(delta_tap) on e."""
-    return {
-        "G": jnp.einsum("nk,nj->kj", e, e),
-        "H": {tap: jnp.einsum("nk,nhwc->kc", e, deltas[tap]) / (deltas[tap].shape[1] * deltas[tap].shape[2])
-              for tap in all_taps()},
-    }
+def dfa_stats(e, deltas, masks):
+    """Sufficient statistics for a ridge fit of e -> the per-channel mean of delta
+    over active (unmasked) positions, the value the masked prediction should take."""
+    def active_mean(tap):
+        m = jnp.broadcast_to(masks[tap], deltas[tap].shape)
+        return jnp.sum(deltas[tap], axis=(1, 2)) / jnp.maximum(jnp.sum(m, axis=(1, 2)), 1)
+
+    return {"G": jnp.einsum("nk,nj->kj", e, e),
+            "H": {tap: jnp.einsum("nk,nc->kc", e, active_mean(tap)) for tap in all_taps()}}
 
 
 def dfa_solve(stats, ridge=1e-3):

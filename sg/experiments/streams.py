@@ -47,10 +47,12 @@ class Stream:
     """The records of one group, in a fixed order.
 
     order 0 keeps the stored (pre-shuffled) order; order k > 0 is a permutation
-    seeded by k. keep: optional predicate on the val image id.
+    seeded by k. keep: optional predicate on the val image id. resize: decode
+    with Resize(256) + CenterCrop(224) (clean val only).
     """
 
-    def __init__(self, group_dir: Path, order: int, batch: int, keep=None):
+    def __init__(self, group_dir: Path, order: int, batch: int, keep=None, resize=False):
+        self.resize = resize
         self.records = []
         for path in imagenet.shard_paths(group_dir, ""):
             reader = ArrayRecordReader(str(path))
@@ -71,13 +73,15 @@ def prefetch_batches(streams, num_steps, workers, depth=3):
     q = queue.Queue(maxsize=depth)
     pool = cf.ThreadPoolExecutor(workers)
 
-    def decode_one(rec):
+    def decode_one(item):
+        rec, resize = item
         label, _, jpeg = decode(rec)
-        return imagenet.load_uint8(jpeg), label
+        return imagenet.load_uint8(jpeg, resize), label
 
     def run():
         for step in range(num_steps):
-            out = list(pool.map(decode_one, [r for s in streams for r in s.batch_records(step)]))
+            items = [(r, s.resize) for s in streams for r in s.batch_records(step)]
+            out = list(pool.map(decode_one, items))
             x = np.stack([o[0] for o in out]).reshape(len(streams), -1, 224, 224, 3)
             y = np.array([o[1] for o in out], np.int32).reshape(len(streams), -1)
             q.put((x, y))
