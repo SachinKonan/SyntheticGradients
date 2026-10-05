@@ -156,5 +156,16 @@ def write_output(out: str, name: str, data: bytes):
         local.write_bytes(data)
         subprocess.run(["gcloud", "storage", "cp", str(local), f"{out}/{name}"], check=True)
     else:
-        Path(out).mkdir(parents=True, exist_ok=True)
+        Path(out, name).parent.mkdir(parents=True, exist_ok=True)
         Path(out, name).write_bytes(data)
+
+
+def read_output(out: str, name: str) -> bytes | None:
+    """Read a file written by write_output, or None if it does not exist."""
+    if out.startswith("gs://"):
+        local = Path("/tmp/synthgrad-in") / name
+        local.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["gcloud", "storage", "cp", f"{out}/{name}", str(local)], capture_output=True)
+        return local.read_bytes() if r.returncode == 0 else None
+    path = Path(out, name)
+    return path.read_bytes() if path.exists() else None
