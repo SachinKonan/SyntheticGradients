@@ -51,7 +51,7 @@ def load_npz(url, cache):
 
 def method_deltas(method, rec, dfa_w, p, stats, sig):
     """BN error signals for one method from the exact signals `sig` (only what it pays for is used)."""
-    logits, true, d_stream, x_hats, block_io, stem, e = sig
+    logits, true, d_stream, x_hats, block_io, stem, e, _ = sig
     if method == "tent":
         return true
     if method == "dfa":

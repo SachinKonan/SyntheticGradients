@@ -58,14 +58,15 @@ def conv(p, x, stride=1):
 
 
 def batchnorm(p, s, x, batch_stats):
-    """Returns (y, x_hat). Batch statistics use the biased variance, as in PyTorch."""
+    """Returns (y, x_hat, inv_std). Batch statistics use the biased variance, as in PyTorch."""
     if batch_stats:
         mean = jnp.mean(x, axis=(0, 1, 2))
         var = jnp.mean(jnp.square(x - mean), axis=(0, 1, 2))
     else:
         mean, var = s["mean"], s["var"]
-    x_hat = (x - mean) * jax.lax.rsqrt(var + BN_EPS)
-    return x_hat * p["scale"] + p["bias"], x_hat
+    inv_std = jax.lax.rsqrt(var + BN_EPS)
+    x_hat = (x - mean) * inv_std
+    return x_hat * p["scale"] + p["bias"], x_hat, inv_std
 
 
 def maxpool(x):
@@ -104,18 +105,19 @@ def head(params, h):
 
 
 def apply(params, stats, x, *, batch_stats, probes=None, stream_probes=None, return_blocks=False):
-    """x: (N, 224, 224, 3) normalized images. Returns (logits, x_hats[, block_io, stem]).
+    """x: (N, 224, 224, 3) normalized images. Returns (logits, x_hats[, block_io, stem, inv_stds]).
 
     probes: optional {bn_name: zeros like that BN's output}; added to the output.
     stream_probes: optional [zeros like each block's output]; added to h_out, so
         their gradient is dL/dh_out of every block.
     block_io: [(h_in, h_out)] for every block, i.e. the residual stream.
     stem: relu(bn1(conv1(x))), the input to the max pool.
+    inv_stds: {bn_name: 1 / std} used by each BN (batch or running statistics).
     """
-    x_hats = {}
+    x_hats, inv_stds = {}, {}
 
     def bn(name, h):
-        y, x_hats[name] = batchnorm(params[name], stats[name], h, batch_stats)
+        y, x_hats[name], inv_stds[name] = batchnorm(params[name], stats[name], h, batch_stats)
         return y if probes is None else y + probes[name]
 
     stem = jax.nn.relu(bn("bn1", conv(params["conv1"], x, stride=2)))
@@ -129,7 +131,7 @@ def apply(params, stats, x, *, batch_stats, probes=None, stream_probes=None, ret
             h = h + stream_probes[k]
         block_io.append((h_in, h))
     logits = head(params, h)
-    return (logits, x_hats, block_io, stem) if return_blocks else (logits, x_hats)
+    return (logits, x_hats, block_io, stem, inv_stds) if return_blocks else (logits, x_hats)
 
 
 def probe_shapes(params, stats, x) -> dict:

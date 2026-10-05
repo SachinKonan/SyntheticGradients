@@ -195,7 +195,7 @@ def main():
         """Exact signals for every stream (vmapped), and the exact Tent update."""
         def one(bn_s, x_s):
             ps = {**params, **bn_s}
-            _, true, d_stream, x_hats, block_io, stem, _ = feedback.exact_signals(
+            _, true, d_stream, x_hats, block_io, stem, _, _ = feedback.exact_signals(
                 ps, stats, imagenet.normalize(x_s), tent.entropy)
             return ps, true, d_stream, x_hats, block_io, stem
         return jax.vmap(one)(bn, x_uint8)

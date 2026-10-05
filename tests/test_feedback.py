@@ -29,7 +29,7 @@ def signals():
     with jax.enable_x64(True):
         params, stats = f64(resnet.load_torchvision(WEIGHTS))
         x = jax.random.normal(jax.random.key(0), (4, 96, 96, 3), jnp.float64)
-        _, deltas, d_stream, x_hats, block_io, stem, _ = feedback.exact_signals(params, stats, x, tent.entropy)
+        _, deltas, d_stream, x_hats, block_io, stem, _, _ = feedback.exact_signals(params, stats, x, tent.entropy)
         yield params, stats, x_hats, block_io, stem, d_stream, deltas
 
 
@@ -178,3 +178,31 @@ def test_nan_safe_cosine_loss(signals):
                 (_, _), grad = jax.value_and_grad(g2.rec_loss, has_aux=True)(
                     rec, params, stats, (x_hats, block_io, stem), d_stream, k, deltas, target)
                 assert all(bool(jnp.isfinite(g).all()) for g in jax.tree.leaves(grad)), (target, k)
+
+
+def test_lowrank_full_rank_is_exact(signals):
+    """Full rank reproduces backprop at every tap: checks the BN backward, masks and conv transposes."""
+    params, stats, x_hats, block_io, stem, d_stream, deltas = signals
+    with jax.enable_x64(True):
+        x = jax.random.normal(jax.random.key(0), (4, 96, 96, 3), jnp.float64)
+        sig = feedback.exact_signals(params, stats, x, tent.entropy)
+        lr = f64(feedback.init_lowrank(params, 1.0))
+        pred = feedback.backward_over_depth(params, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
+                                            lowrank=lr, inv_stds=sig.inv_stds)
+        assert_taps_equal(pred, sig.deltas)
+
+
+def test_lowrank_rank_trends(signals):
+    """Lower rank is cheaper and less accurate; every rank beats shortcut-only."""
+    params, stats, *_ = signals
+    with jax.enable_x64(True):
+        x = jax.random.normal(jax.random.key(0), (4, 96, 96, 3), jnp.float64)
+        sig = feedback.exact_signals(params, stats, x, tent.entropy)
+        back = lambda **kw: feedback.backward_over_depth(params, stats, sig.x_hats, sig.block_io, sig.stem,
+                                                         sig.d_stream, inv_stds=sig.inv_stds, **kw)
+        cos = lambda pred: float(feedback.compare(pred, sig.deltas, sig.x_hats)[1][0])
+        scores = [cos(back(lowrank=f64(feedback.init_lowrank(params, f)))) for f in (1 / 16, 1 / 4, 1.0)]
+        assert scores[0] < scores[1] < scores[2] and abs(scores[2] - 1) < 1e-8, scores
+        assert scores[0] > cos(back(branch_term="none")), scores
+    costs = [feedback.lowrank_cost(f) for f in (1 / 16, 1 / 4, 1.0)]
+    assert costs[0] < costs[1] < costs[2]

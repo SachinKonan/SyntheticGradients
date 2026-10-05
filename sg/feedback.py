@@ -18,6 +18,9 @@ shortcut term exactly, and replaces the branch with one of:
   "none"        nothing: shortcut-only feedback, branch taps get no signal
   a recurrence  a low-rank state s carried down the depth: a learned
                 correction U_l s_l for d_l, and heads V s for the branch taps
+  low-rank      the true branch backward (exact ReLU masks and BN backward)
+                with each conv replaced by a rank-r factorization, initialized
+                from the SVD of the real weights; full rank is exact
 
 Hybrid: with exact_top = k the top k blocks are backpropagated exactly (their
 branch taps are taken from the exact signals). That makes the error at the
@@ -26,6 +29,8 @@ its branch taps would need its own branch VJP, so they are predicted.
 
 DFA predicts each tap directly from the output error instead.
 """
+
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -57,26 +62,33 @@ def tap_widths() -> dict:
     return widths
 
 
-def exact_signals(params, stats, x, loss_from_logits):
-    """One forward + one backward with probes on every BN output and every block output.
+class Signals(NamedTuple):
+    logits: jax.Array
+    deltas: dict      # {bn: dL/dy}, exact
+    d_stream: list    # [dL/dh_out per block], exact
+    x_hats: dict      # {bn: normalized input}
+    block_io: list    # [(h_in, h_out) per block]
+    stem: jax.Array   # input to the max pool
+    e: jax.Array      # dL/dlogits
+    inv_stds: dict    # {bn: 1 / batch std}
 
-    Returns logits, deltas {bn: dL/dy}, d_stream [dL/dh_out per block], x_hats,
-    block_io, stem, and e = dL/dlogits.
-    """
+
+def exact_signals(params, stats, x, loss_from_logits) -> Signals:
+    """One forward + one backward with probes on every BN output and every block output."""
     fwd = lambda p, s, x: resnet.apply(p, s, x, batch_stats=True, return_blocks=True)
-    _, x_hat_shapes, io_shapes, _ = jax.eval_shape(fwd, params, stats, x)
+    _, x_hat_shapes, io_shapes, _, _ = jax.eval_shape(fwd, params, stats, x)
     zeros = lambda sd: jnp.zeros(sd.shape, sd.dtype)
     probes = jax.tree.map(zeros, x_hat_shapes)
     stream = [zeros(h_out) for _, h_out in io_shapes]
 
     def loss(probes, stream):
-        logits, x_hats, block_io, stem = resnet.apply(
-            params, stats, x, batch_stats=True, probes=probes, stream_probes=stream, return_blocks=True)
-        return loss_from_logits(logits), (logits, x_hats, block_io, stem)
+        out = resnet.apply(params, stats, x, batch_stats=True, probes=probes, stream_probes=stream,
+                           return_blocks=True)
+        return loss_from_logits(out[0]), out
 
-    (deltas, d_stream), (logits, x_hats, block_io, stem) = jax.grad(
+    (deltas, d_stream), (logits, x_hats, block_io, stem, inv_stds) = jax.grad(
         loss, argnums=(0, 1), has_aux=True)(probes, stream)
-    return logits, deltas, d_stream, x_hats, block_io, stem, jax.grad(loss_from_logits)(logits)
+    return Signals(logits, deltas, d_stream, x_hats, block_io, stem, jax.grad(loss_from_logits)(logits), inv_stds)
 
 
 def relu_mask(params, x_hats, name):
@@ -205,10 +217,74 @@ def _depthwise3x3(s, w):
         dimension_numbers=("NHWC", "HWIO", "NHWC"), feature_group_count=s.shape[-1])
 
 
+# ----------------------------------------------------------------------------- low-rank backward
+
+def init_lowrank(params, frac):
+    """Rank-r factors of every branch conv, r = max(1, round(frac * mid)), from the SVD.
+
+    1x1 convs: W (c_in, c_out) ~ P (c_in, r) @ Q (r, c_out).
+    3x3 conv:  W as (9 c_in, c_out) ~ P @ Q, P reshaped to a (3, 3, c_in, r) kernel.
+    """
+    def factor(w, r):
+        u, s, vt = np.linalg.svd(np.asarray(w, np.float64), full_matrices=False)
+        return (u[:, :r] * s[:r]).astype(w.dtype), vt[:r].astype(w.dtype)
+
+    blocks = []
+    for pre, _, _ in resnet.blocks():
+        w1, w2, w3 = (np.asarray(params[f"{pre}.conv{i}"]["w"]) for i in (1, 2, 3))
+        mid = w1.shape[-1]
+        r = max(1, round(frac * mid))
+        p1, q1 = factor(w1.reshape(w1.shape[2], mid), r)
+        p2, q2 = factor(w2.reshape(9 * mid, mid), r)
+        p3, q3 = factor(w3.reshape(mid, w3.shape[-1]), r)
+        blocks.append({"c1": {"P": p1, "Q": q1}, "c2": {"P": p2.reshape(3, 3, mid, r), "Q": q2},
+                       "c3": {"P": p3, "Q": q3}})
+    return {"blocks": blocks}
+
+
+def _bn_backward(params, x_hats, inv_stds, name, dy):
+    """dL/dx of a batch-statistics BN given dL/dy (exact, cheap)."""
+    x_hat, mean = x_hats[name], lambda a: jnp.mean(a, axis=(0, 1, 2))
+    return params[name]["scale"] * inv_stds[name] * (dy - mean(dy) - x_hat * mean(dy * x_hat))
+
+
+def _lowrank_branch(params, x_hats, inv_stds, lr, pre, stride, g):
+    """Branch backward with low-rank convs. g: error at bn3's output.
+    Returns (dL/dh_in through the branch, delta at bn1, delta at bn2)."""
+    mask = lambda name: relu_mask(params, x_hats, name)
+    t1x1 = lambda dy, f: jnp.einsum("nhwc,rc,kr->nhwk", dy, f["Q"], f["P"])  # transpose of x @ P @ Q
+
+    def conv2_lowrank(a):
+        z = jax.lax.conv_general_dilated(a, lr["c2"]["P"], (stride, stride), [(1, 1), (1, 1)],
+                                         dimension_numbers=("NHWC", "HWIO", "NHWC"))
+        return jnp.einsum("nhwr,rc->nhwc", z, lr["c2"]["Q"])
+
+    dz3 = _bn_backward(params, x_hats, inv_stds, f"{pre}.bn3", g)
+    delta2 = jnp.where(mask(f"{pre}.bn2"), t1x1(dz3, lr["c3"]), 0.0)
+    dz2 = _bn_backward(params, x_hats, inv_stds, f"{pre}.bn2", delta2)
+    _, vjp2 = jax.vjp(conv2_lowrank, jnp.zeros_like(x_hats[f"{pre}.bn1"]))
+    delta1 = jnp.where(mask(f"{pre}.bn1"), vjp2(dz2)[0], 0.0)
+    dz1 = _bn_backward(params, x_hats, inv_stds, f"{pre}.bn1", delta1)
+    return t1x1(dz1, lr["c1"]), delta1, delta2
+
+
+def lowrank_cost(frac):
+    """Multiply-adds of the low-rank branch backward relative to the exact one (convs only)."""
+    num = den = 0.0
+    h = 224 // 4
+    for (pre, stride, _), c_in, c_out in zip(resnet.blocks(), block_in_widths(), block_out_widths()):
+        mid, ho = c_out // resnet.EXPANSION, h // stride
+        r = max(1, round(frac * mid))
+        den += h * h * c_in * mid + ho * ho * mid * mid * 9 + ho * ho * mid * c_out
+        num += h * h * r * (c_in + mid) + ho * ho * r * (9 * mid + mid) + ho * ho * r * (mid + c_out)
+        h = ho
+    return num / den
+
+
 # ----------------------------------------------------------------------------- backward
 
 def backward_over_depth(params, stats, x_hats, block_io, stem, d_exact, exact_deltas=None, *,
-                        exact_top=0, branch_term="none", rec=None):
+                        exact_top=0, branch_term="none", rec=None, lowrank=None, inv_stds=None):
     """Error signals at all 53 BN taps.
 
     d_exact: exact dL/dh_out of every block (d_exact[-1] is the seed at the top
@@ -217,6 +293,7 @@ def backward_over_depth(params, stats, x_hats, block_io, stem, d_exact, exact_de
         exactly backpropagated blocks (indices > n-1-exact_top) only.
     exact_top: number of top blocks backpropagated exactly (may be traced).
     branch_term: "exact" | "none". rec: recurrence params.
+    lowrank: low-rank factors (init_lowrank); needs inv_stds from the forward pass.
     Returns {tap: delta}.
     """
     n = len(block_io)
@@ -242,6 +319,10 @@ def backward_over_depth(params, stats, x_hats, block_io, stem, d_exact, exact_de
             d_next = d_next + d_branch
         else:
             delta1, delta2 = jnp.zeros_like(x_hats[b1]), jnp.zeros_like(x_hats[b2])
+            if lowrank is not None:
+                d_branch, delta1, delta2 = _lowrank_branch(
+                    params, x_hats, inv_stds, lowrank["blocks"][k], pre, stride, g)
+                d_next = d_next + d_branch
             if rec is not None:
                 r = rec["blocks"][k]
                 # (Re)seed the state from the exact error wherever this block is exact.

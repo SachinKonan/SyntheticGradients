@@ -97,7 +97,7 @@ def rec_loss(rec, params, stats, fwd, d_stream, exact_top, true, target):
 
 def fit_stream(bn, velocity, dfa_acc, x_uint8, y, exact_top, params, stats, rec, *, lr, momentum, target):
     p = {**params, **bn}
-    logits, true, d_stream, x_hats, block_io, stem, e = feedback.exact_signals(
+    logits, true, d_stream, x_hats, block_io, stem, e, _ = feedback.exact_signals(
         p, stats, imagenet.normalize(x_uint8), tent.entropy)
     (loss, pred), grad = jax.value_and_grad(rec_loss, has_aux=True)(
         rec, p, stats, (x_hats, block_io, stem), d_stream, exact_top, true, target)
@@ -111,7 +111,7 @@ def fit_stream(bn, velocity, dfa_acc, x_uint8, y, exact_top, params, stats, rec,
 def test_stream(bn, velocity, acc, x_uint8, y, quarter, params, stats, rec, w_fit, w_rand,
                 *, lr, momentum, exact_tops):
     p = {**params, **bn}
-    logits, true, d_stream, x_hats, block_io, stem, e = feedback.exact_signals(
+    logits, true, d_stream, x_hats, block_io, stem, e, _ = feedback.exact_signals(
         p, stats, imagenet.normalize(x_uint8), tent.entropy)
     masks = feedback.tap_masks(p, x_hats, block_io, stem)
     back = functools.partial(feedback.backward_over_depth, p, stats, x_hats, block_io, stem, d_stream, true)
