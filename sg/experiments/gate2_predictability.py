@@ -155,8 +155,10 @@ def main():
     p.add_argument("--lr", type=float, default=2.5e-4, help="Tent")
     p.add_argument("--momentum", type=float, default=0.9, help="Tent")
     p.add_argument("--target", default="full_cos", choices=["delta", "tap_cos", "full_cos", "full_mse"])
-    p.add_argument("--k-schedule", default="anneal", choices=["anneal", "uniform"],
-                   help="training draws of k (exact top blocks): uniform over 0..15, or a floor annealed 15 -> 0")
+    p.add_argument("--k-schedule", default="anneal", choices=["anneal", "uniform", "slide"],
+                   help="training draws of k (exact top blocks): uniform over 0..15; anneal: uniform over "
+                        "[floor, 15] with the floor falling 15 -> 0; slide: a window of 4 values sliding "
+                        "from [12, 15] to [0, 3], then k = 0 for the last 25%% of training")
     p.add_argument("--rank", type=int, default=64)
     p.add_argument("--no-mix", action="store_true")
     p.add_argument("--rec-lr", type=float, default=1e-3)
@@ -233,8 +235,7 @@ def main():
     total_steps = args.fit_passes * fit_steps
 
     def draw_k(t):
-        floor = 0 if args.k_schedule == "uniform" else round(k_max * max(0.0, 1 - t / (0.75 * total_steps)))
-        return np.int32(k_rng.integers(floor, k_max + 1))
+        return np.int32(draw_k_schedule(args.k_schedule, t, total_steps, k_max, k_rng))
 
     t0 = time.time()
     for pass_ in range(args.fit_passes):
@@ -293,6 +294,17 @@ def main():
         flat, _ = jax.tree_util.tree_flatten_with_path({"rec": rec_np, "dfa_fit": w_fit_np})
         np.savez(buf, **{jax.tree_util.keystr(k): np.asarray(v) for k, v in flat})
         st.write_output(args.out, "predictors.npz", buf.getvalue())
+
+
+def draw_k_schedule(schedule, t, total_steps, k_max, rng):
+    """Number of exactly backpropagated top blocks for training step t."""
+    progress = max(0.0, 1 - t / (0.75 * total_steps))  # 1 -> 0 over the first 75% of training
+    if schedule == "uniform":
+        return rng.integers(0, k_max + 1)
+    if schedule == "anneal":
+        return rng.integers(round(k_max * progress), k_max + 1)
+    top = round(k_max * progress)  # slide
+    return rng.integers(max(0, top - 3), top + 1)
 
 
 def _tap_shapes(batch):
