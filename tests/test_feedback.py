@@ -315,3 +315,20 @@ def test_filter_knob_gradients_are_finite_with_zero_gradients():
 
     grads = jax.grad(loss)(knobs)
     assert all(bool(jnp.isfinite(v)) for v in jax.tree.leaves(grads))
+
+
+def test_per_stream_1x1_conv_weights_shard_correctly():
+    """Each stream carrying its own 1x1 conv weights, sharded across devices, must match the
+    single-device result (vmapped lax.conv kernels did not). Needs >= 2 devices, e.g.
+    XLA_FLAGS=--xla_force_host_platform_device_count=2."""
+    if len(jax.devices()) < 2:
+        pytest.skip("needs 2 devices")
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    key = jax.random.key(0)
+    w = jax.random.normal(key, (2, 1, 1, 16, 8))  # per-stream 1x1 kernels
+    x = jax.random.normal(jax.random.fold_in(key, 1), (2, 4, 6, 6, 16))
+    f = jax.jit(jax.vmap(lambda w, x: resnet.conv({"w": w}, x, stride=2)))
+    ref = f(w, x)
+    sh = NamedSharding(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("s",)), P("s"))
+    out = f(jax.device_put(w, sh), jax.device_put(x, sh))
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)

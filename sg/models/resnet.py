@@ -51,6 +51,11 @@ def load_torchvision(path: str) -> tuple[dict, dict]:
 
 def conv(p, x, stride=1):
     k = p["w"].shape[0]
+    if k == 1:
+        # A 1x1 conv is a per-pixel matmul. As an einsum it also shards correctly when every
+        # stream carries its own weights (vmapped lax.conv kernels gave wrong sharded results).
+        x = x[:, ::stride, ::stride, :] if stride > 1 else x
+        return jnp.einsum("nhwc,cd->nhwd", x, p["w"][0, 0])
     pad = (k - 1) // 2
     return jax.lax.conv_general_dilated(
         x, p["w"], (stride, stride), [(pad, pad), (pad, pad)],
