@@ -270,6 +270,21 @@ def init_lowrank(params, frac):
     return {"blocks": blocks}
 
 
+def init_precond(params):
+    """A learned per-parameter scale on the EXACT BN gradient (a diagonal preconditioner).
+    The control for 'is the gain from the learned update rule or from the predicted signal?'"""
+    return {"log_scale": {n: {"scale": np.zeros_like(np.asarray(params[n]["scale"])),
+                              "bias": np.zeros_like(np.asarray(params[n]["bias"]))} for n in resnet.bn_names()}}
+
+
+def is_precond(pred) -> bool:
+    return "log_scale" in pred
+
+
+def apply_precond(pred, grads):
+    return {n: {k: grads[n][k] * jnp.exp(pred["log_scale"][n][k]) for k in ("scale", "bias")} for n in grads}
+
+
 def is_lowrank(pred) -> bool:
     return "c1" in pred["blocks"][0]
 

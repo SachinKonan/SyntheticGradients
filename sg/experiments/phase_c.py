@@ -46,7 +46,10 @@ sg_ = jax.lax.stop_gradient
 
 
 def load_predictor(url, params_np, cache):
-    """A saved predictor, or 'svd:<frac>' for the untrained low-rank backward (no pretraining)."""
+    """A saved predictor, 'svd:<frac>' for the untrained low-rank backward (no pretraining),
+    or 'precond' for the exact gradient with a learned per-parameter scale (the Gate 4 control)."""
+    if url == "precond":
+        return feedback.init_precond(params_np), {"arch": "precond", "config": "exact gradient, learned scale"}
     if url.startswith("svd:"):
         frac = float(url.removeprefix("svd:"))
         return feedback.init_lowrank(params_np, frac), {"arch": "lowrank", "lowrank_frac": frac, "rank": 64,
@@ -75,6 +78,7 @@ def main():
     ap.add_argument("--step-lr", type=float, default=1e-2, help="Adam lr of the log step multiplier")
     ap.add_argument("--imitation", type=float, default=0.1)
     ap.add_argument("--epochs", type=int, default=8)
+    ap.add_argument("--seed", type=int, default=0, help="training stream order (0 reproduces earlier runs)")
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2.5e-4, help="Tent's step size")
     ap.add_argument("--momentum", type=float, default=0.9)
@@ -127,11 +131,14 @@ def main():
         """Predictor's BN gradient at the current state; every ResNet quantity is stop-gradient."""
         p = sg_({**params, **bn_s})
         sig = sg_(feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy))
-        deltas = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
-                                              sig.deltas, exact_top=args.exact_top,
-                                              **feedback.predictor_kwargs(phi, sig.inv_stds))
-        g = resnet.bn_grads(deltas, sig.x_hats)
         g_true = resnet.bn_grads(sig.deltas, sig.x_hats)
+        if feedback.is_precond(phi):  # exact gradient, learned scale
+            g = feedback.apply_precond(phi, g_true)
+        else:
+            deltas = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
+                                                  sig.deltas, exact_top=args.exact_top,
+                                                  **feedback.predictor_kwargs(phi, sig.inv_stds))
+            g = resnet.bn_grads(deltas, sig.x_hats)
         flat = lambda t: jnp.concatenate([jnp.concatenate([t[n]["scale"], t[n]["bias"]]) for n in resnet.bn_names()])
         return g, 1 - cosine(flat(g), flat(g_true)), sig.logits
 
@@ -202,7 +209,8 @@ def main():
     t0, n = time.time(), 0
     for epoch in range(start_epoch, args.epochs):
         for s, spec_id in zip(train, sm.local_ids):
-            s.perm = np.random.default_rng([epoch, specs[spec_id][1], spec_id]).permutation(len(s.records))
+            key = [epoch, specs[spec_id][1], spec_id] + ([args.seed] if args.seed else [])
+            s.perm = np.random.default_rng(key).permutation(len(s.records))
         bn, vel = fresh(bn0)
         batches = st.prefetch_batches(train, outer_per_epoch * K + 1, args.decode_workers)
         x_prev, y_prev = next(batches)

@@ -54,7 +54,7 @@ def load_npz(url, cache):
 def method_deltas(method, rec, dfa_w, p, stats, sig):
     """BN error signals for one method from the exact signals `sig` (only what it pays for is used).
     rec: the method's predictor (recurrence, GRU or low-rank factors), or None."""
-    if method == "tent":
+    if method == "tent" or (rec is not None and feedback.is_precond(rec)):
         return sig.deltas
     if method == "dfa":
         return feedback.dfa_predict(dfa_w, sig.e, feedback.tap_masks(p, sig.x_hats, sig.block_io, sig.stem))
@@ -108,7 +108,8 @@ def main():
         arch = meta.get("arch", "recurrence")
         template = {"recurrence": lambda: feedback.init_recurrence(jax.random.key(0), meta.get("rank", args.rank)),
                     "gru": lambda: feedback.init_gru(jax.random.key(0), meta.get("rank", args.rank)),
-                    "lowrank": lambda: feedback.init_lowrank(params_np, meta["lowrank_frac"])}[arch]()
+                    "lowrank": lambda: feedback.init_lowrank(params_np, meta["lowrank_frac"]),
+                    "precond": lambda: feedback.init_precond(params_np)}[arch]()
         recs[name] = sm.replicate(unflatten(template, load_npz(url, cache)))
         log(f"predictor {name}: {arch} {meta.get('config')}")
     for m in methods:  # untrained low-rank backward, from the SVD of the real convs
@@ -146,6 +147,8 @@ def main():
                     correct = jnp.sum(sig[0].argmax(-1) == y_s)  # scored before the update
                     deltas = method_deltas(method, rec, dfa_w, p, stats, sig)
                     grads = resnet.bn_grads(deltas, sig[3])
+                    if rec is not None and feedback.is_precond(rec):
+                        grads = feedback.apply_precond(rec, grads)
                     new_bn, new_vel = tent.sgd_momentum(bn_s, grads, vel_s, args.lr * mult, args.momentum)
                     ok = jnp.all(jnp.stack([jnp.all(jnp.isfinite(a)) for a in jax.tree.leaves(new_bn)]))
                     keep = lambda a, b: jax.tree.map(lambda u, v: jnp.where(ok, u, v), a, b)
