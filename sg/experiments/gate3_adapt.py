@@ -21,9 +21,16 @@ multiplier on --set val (the fit corruptions on held-out images), then read the
 test error at that multiplier from --set test; scripts/gate3_report.py does it.
 
 Streams:
-  val   the 4 fit corruptions (all severities) on odd val ids
-  test  the 15 test corruptions at severity 5 + clean, on odd val ids
-(no predictor was trained on odd ids or on test corruptions).
+  val         the 4 fit corruptions (all severities) on odd val ids
+  test        the 15 test corruptions at severity 5 + clean, on odd val ids
+  continual   the 15 test corruptions back to back with no reset (as in CoTTA),
+              --continual-images per corruption, a different random order per stream
+  r / sketch / v2   ImageNet-R / -Sketch / -V2 (natural shifts never seen in
+              training), all images, a different random order per stream; for
+              ImageNet-R, logits (predictions and the entropy loss) are restricted
+              to its 200 classes
+(no predictor was trained on odd ids or on test corruptions). For continual, error
+is also reported per position in the sequence.
 """
 
 import argparse
@@ -67,7 +74,8 @@ def method_deltas(method, rec, dfa_w, p, stats, sig):
 def main():
     ap = argparse.ArgumentParser()
     st.add_launch_args(ap)
-    ap.add_argument("--set", required=True, choices=["val", "test"])
+    ap.add_argument("--set", required=True, choices=["val", "test", "continual", "r", "sketch", "v2"])
+    ap.add_argument("--continual-images", type=int, default=5000, help="images per corruption (continual)")
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2.5e-4, help="Tent's step size; scaled by each multiplier")
     ap.add_argument("--momentum", type=float, default=0.9)
@@ -86,7 +94,15 @@ def main():
     lead = jax.process_index() == 0
     log = (lambda *a: print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)) if lead else (lambda *a: None)
 
-    specs = (fit_specs() if args.set == "val" else test_specs())[: args.streams]
+    shift_group = {"r": "imagenet_r", "sketch": "imagenet_sketch", "v2": "imagenet_v2"}.get(args.set)
+    if shift_group:
+        specs = [(shift_group, i) for i in range(args.streams or 32)]
+    elif args.set == "continual":
+        n_streams = args.streams or 32
+        orders = [np.random.default_rng([7, i]).permutation(len(imagenet.TEST_CORRUPTIONS)) for i in range(n_streams)]
+        specs = [(f"continual/{i}", 0) for i in range(n_streams)]
+    else:
+        specs = (fit_specs() if args.set == "val" else test_specs())[: args.streams]
     S = len(specs)
     sm = st.StreamMesh(S)
     mults = np.array([float(m) for m in args.mults.split(",")], np.float32)
@@ -95,8 +111,47 @@ def main():
     log(f"set {args.set}: {S} streams, methods {methods}, multipliers {mults.tolist()}")
 
     cache = Path(args.local_cache)
-    streams = [st.Stream(st.fetch(args.data_root, specs[s][0], cache), specs[s][1], args.batch, test_ids,
-                         resize=imagenet.needs_resize(specs[s][0])) for s in sm.local_ids]
+    n_seg = 1
+    if args.set == "continual":
+        groups = [f"imagenet_c/{c}/5" for c in imagenet.TEST_CORRUPTIONS]
+        steps_each = args.continual_images // args.batch
+        # One copy of each corruption's records per host; every stream draws its own order.
+        loaded = {g: st.Stream(st.fetch(args.data_root, g, cache), 0, args.batch, test_ids) for g in groups}
+
+        def view(g, seed):
+            v = st.Stream.__new__(st.Stream)
+            v.records, v.batch, v.resize = loaded[g].records, args.batch, False
+            v.perm = np.random.default_rng(seed).permutation(len(v.records))
+            v.num_steps = len(v.records) // args.batch
+            return v
+
+        streams = [st.ConcatStream([view(groups[c], [s, j]) for j, c in enumerate(orders[s])], steps_each)
+                   for s in sm.local_ids]
+        n_seg = len(groups)
+    elif shift_group:
+        shared = st.Stream(st.fetch(args.data_root, shift_group, cache), 0, args.batch, None, resize=True)
+
+        def view(order):
+            v = st.Stream.__new__(st.Stream)
+            v.records, v.batch, v.resize, v.num_steps = shared.records, args.batch, True, shared.num_steps
+            v.perm = np.arange(len(v.records)) if order == 0 else np.random.default_rng(order).permutation(len(v.records))
+            return v
+
+        streams = [view(specs[s][1]) for s in sm.local_ids]
+    else:
+        streams = [st.Stream(st.fetch(args.data_root, specs[s][0], cache), specs[s][1], args.batch, test_ids,
+                             resize=imagenet.needs_resize(specs[s][0])) for s in sm.local_ids]
+
+    # ImageNet-R: restrict logits to its 200 classes (predictions and the entropy loss).
+    subset_file = (st.fetch(args.data_root, shift_group, cache) / "class_subset.json") if shift_group else None
+    if subset_file is not None and subset_file.exists():
+        class_mask = np.zeros(1000, bool)
+        class_mask[json.loads(subset_file.read_text())] = True
+        mask_logits = lambda l: jnp.where(class_mask, l, -1e9)
+        log(f"restricting logits to {class_mask.sum()} classes")
+    else:
+        mask_logits = lambda l: l
+    loss_fn = lambda logits: tent.entropy(mask_logits(logits))
     params, stats = sm.replicate(resnet.load_torchvision(st.fetch_file(args.weights, cache)))
     bn0 = tent.bn_params(params)
 
@@ -129,6 +184,7 @@ def main():
             x_s = imagenet.normalize(x_s)
             src, _ = resnet.apply(params, stats, x_s, batch_stats=False)
             bna, _ = resnet.apply(params, stats, x_s, batch_stats=True)
+            src, bna = mask_logits(src), mask_logits(bna)
             return jnp.stack([jnp.sum(src.argmax(-1) == y_s), jnp.sum(bna.argmax(-1) == y_s)])
         return jax.vmap(one)(x, y)
 
@@ -143,8 +199,8 @@ def main():
 
                 def per_stream(bn_s, vel_s, x_s, y_s):
                     p = {**params, **bn_s}
-                    sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy)
-                    correct = jnp.sum(sig[0].argmax(-1) == y_s)  # scored before the update
+                    sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), loss_fn)
+                    correct = jnp.sum(mask_logits(sig[0]).argmax(-1) == y_s)  # scored before the update
                     deltas = method_deltas(method, rec, dfa_w, p, stats, sig)
                     grads = resnet.bn_grads(deltas, sig[3])
                     if rec is not None and feedback.is_precond(rec):
@@ -166,7 +222,9 @@ def main():
                     out_shardings=traj_shard)
     state = {m: (fresh(bn0), jax.tree.map(jnp.zeros_like, fresh(bn0))) for m in methods}
     totals = {m: np.zeros((len(mults), S, 2), np.int64) for m in methods}
+    seg_correct = {m: np.zeros((len(mults), S, n_seg), np.int64) for m in methods}  # by position in sequence
     ref_total = np.zeros((S, 2), np.int64)
+    steps_per_seg = max(1, num_steps // n_seg)
 
     t0 = time.time()
     for step_i, (x, y) in enumerate(st.prefetch_batches(streams, num_steps, args.decode_workers)):
@@ -176,10 +234,12 @@ def main():
             bn, vel = state[m]
             bn, vel, counts = steps[m](bn, vel, xg, yg)
             state[m] = (bn, vel)
-            totals[m] += np.asarray(multihost_utils.process_allgather(counts, tiled=True))
+            c = np.asarray(multihost_utils.process_allgather(counts, tiled=True))
+            totals[m] += c
+            seg_correct[m][:, :, min(step_i // steps_per_seg, n_seg - 1)] += c[:, :, 0]
         if step_i == 0 or (step_i + 1) % 50 == 0 or step_i + 1 == num_steps:
             n = (step_i + 1) * args.batch
-            corrupt = np.array([g.startswith("imagenet_c/") for g, _ in specs])
+            corrupt = np.array([not g.startswith("imagenet_val") for g, _ in specs])
             err = lambda c: 100 * (1 - c[..., corrupt].sum(-1) / (n * corrupt.sum()))
             ref = 100 * (1 - ref_total[corrupt].sum(0) / (n * corrupt.sum()))
             best = {m: f"{err(totals[m][:, :, 0]).min():.1f}" for m in methods}
@@ -193,6 +253,9 @@ def main():
                "reference_error": {"no_adapt": (100 * (1 - ref_total[:, 0] / images)).tolist(),
                                    "bn_adapt": (100 * (1 - ref_total[:, 1] / images)).tolist()},
                "error": {m: (100 * (1 - totals[m][:, :, 0] / images)).tolist() for m in methods},
+               "error_by_position": {m: (100 * (1 - seg_correct[m] / (steps_per_seg * args.batch))).mean(1).tolist()
+                                     for m in methods} if n_seg > 1 else None,
+               "continual_orders": [o.tolist() for o in orders] if args.set == "continual" else None,
                "skipped_updates": {m: totals[m][:, :, 1].tolist() for m in methods}}
         st.write_output(args.out, "results.json", json.dumps(out).encode())
         log("done")

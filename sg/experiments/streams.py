@@ -171,3 +171,17 @@ def read_output(out: str, name: str) -> bytes | None:
         return local.read_bytes() if r.returncode == 0 else None
     path = Path(out, name)
     return path.read_bytes() if path.exists() else None
+
+
+class ConcatStream:
+    """Several streams back to back, `steps_each` batches from each, no reset between them
+    (continual adaptation). Segment i uses its own Stream's order."""
+
+    def __init__(self, segments, steps_each: int):
+        self.segments, self.steps_each = segments, steps_each
+        assert all(s.num_steps >= steps_each for s in segments)
+        self.num_steps = steps_each * len(segments)
+        self.resize = segments[0].resize
+
+    def batch_records(self, step):
+        return self.segments[step // self.steps_each].batch_records(step % self.steps_each)

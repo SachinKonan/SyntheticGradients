@@ -66,8 +66,9 @@ def normalize(x_uint8):
 
 
 def needs_resize(group: str) -> bool:
-    """Clean val holds original-size JPEGs; ImageNet-C groups are already 224x224."""
-    return group.startswith("imagenet_val")
+    """ImageNet-C groups are stored at 224x224; everything else (clean val, ImageNet-R,
+    -Sketch, -V2) holds original-size images."""
+    return not group.startswith("imagenet_c/")
 
 
 def preprocess(jpeg: bytes, resize: bool | None = None) -> np.ndarray:

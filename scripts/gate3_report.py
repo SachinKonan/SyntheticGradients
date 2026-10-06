@@ -39,7 +39,7 @@ def main():
 
     def masks(r):
         groups = [s["group"] for s in r["streams"]]
-        corrupt = np.array([g.startswith("imagenet_c/") for g in groups])
+        corrupt = np.array([not g.startswith("imagenet_val") for g in groups])  # everything but clean
         return groups, corrupt
 
     _, v_corrupt = masks(val)
@@ -62,7 +62,7 @@ def main():
                      "share_of_tent_gain": float((no_adapt - t_err[m][i]) / (no_adapt - tent_err)),
                      "skipped_updates": int(np.array(test["skipped_updates"][m])[i].sum())})
 
-    print(f"ImageNet-C severity 5, test half of the images, mean over 15 corruptions x 2 orders")
+    print(f"test set: {test['set']}  (corrupt/shifted streams averaged; clean apart)")
     print(f"  no adaptation   {no_adapt:5.1f}")
     print(f"  BN-adapt        {bn_adapt:5.1f}")
     print(f"  {'method':12s} {'step x':>7s} {'test err':>9s} {'share of Tent gain':>19s} {'clean':>6s} {'(val err)':>10s}")
@@ -71,6 +71,12 @@ def main():
         print(f"  {r['method']:12s} {r['multiplier']:7g} {r['test_error']:9.1f} {r['share_of_tent_gain']:19.2f} "
               f"{clean} {r['val_error']:10.1f}" + (f"  [{r['skipped_updates']} skipped]" if r["skipped_updates"] else ""))
     print("  tent at the paper step size (x1):", f"{t_err['tent'][mults.index(1.0)]:.1f}")
+    if test.get("error_by_position"):
+        print("\n  continual: error by position in the corruption sequence (chosen multiplier)")
+        for m in t_err:
+            pos = np.array(test["error_by_position"][m])[chosen[m]]
+            print(f"  {m:12s} first {pos[0]:5.1f}  middle {pos[len(pos) // 2]:5.1f}  last {pos[-1]:5.1f}  "
+                  f"(first 5 mean {pos[:5].mean():5.1f}, last 5 mean {pos[-5:].mean():5.1f})")
     print("\n  test error at every multiplier (corrupt mean):")
     print(f"  {'method':12s} " + " ".join(f"{'x' + format(m, 'g'):>7s}" for m in mults))
     for m in t_err:
