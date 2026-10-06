@@ -271,3 +271,47 @@ def test_fetch_file_cache_keys_on_full_path(tmp_path):
         assert len(calls) == 2  # cached by full path
     finally:
         subprocess.run = real
+
+
+def test_prefetch_surfaces_loader_errors():
+    from sg.experiments import streams as st
+
+    class Broken:
+        resize = False
+        def batch_records(self, step):
+            raise IndexError("boom")
+
+    with pytest.raises(IndexError):
+        list(st.prefetch_batches([Broken()], 3, workers=1))
+
+
+def test_filter_rule_matches_its_formula():
+    """Adam-form filter: bias-corrected average / sqrt(average square), plus the anchor."""
+    from sg import timerule
+    bn = {n: {"scale": jnp.ones(3), "bias": jnp.zeros(3)} for n in resnet.bn_names()[:1]}
+    names = list(bn)
+    eta = {n: 0.1 for n in resnet.bn_names()}
+    knobs = {n: v for n, v in timerule.init_knobs("filter", eta=eta, anchor=0.01).items() if n in names}
+    g = {n: {"scale": jnp.array([1.0, -2.0, 0.5]), "bias": jnp.array([0.1, 0.1, 0.1])} for n in names}
+    state = timerule.init_state("filter", bn)
+    new, state = timerule.apply("filter", knobs, state, bn, g, bn, lr=0.0, mult=1.0)
+    # First step: bias-corrected avg = g, sq = g^2, so the step is eta * sign(g); source = start.
+    np.testing.assert_allclose(new[names[0]]["scale"], 1 - 0.1 * np.sign([1.0, -2.0, 0.5]), rtol=1e-5)
+
+
+def test_filter_knob_gradients_are_finite_with_zero_gradients():
+    from sg import timerule
+    names = resnet.bn_names()[:2]
+    bn = {n: {"scale": jnp.ones(3), "bias": jnp.zeros(3)} for n in names}
+    knobs = {n: v for n, v in timerule.init_knobs("filter", eta={n: 0.1 for n in resnet.bn_names()}).items()
+             if n in names}
+    g = {n: {"scale": jnp.array([0.0, 1.0, -1.0]), "bias": jnp.zeros(3)} for n in names}  # exact zeros
+
+    def loss(knobs):
+        state = timerule.init_state("filter", bn)
+        w, state = timerule.apply("filter", knobs, state, bn, g, bn, lr=0.0, mult=1.0)
+        w, state = timerule.apply("filter", knobs, state, w, g, bn, lr=0.0, mult=1.0)
+        return sum(jnp.sum(v["scale"] ** 2) for v in w.values())
+
+    grads = jax.grad(loss)(knobs)
+    assert all(bool(jnp.isfinite(v)) for v in jax.tree.leaves(grads))

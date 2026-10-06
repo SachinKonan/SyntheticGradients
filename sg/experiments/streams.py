@@ -81,16 +81,21 @@ def prefetch_batches(streams, num_steps, workers, depth=3):
         return imagenet.load_uint8(jpeg, resize), label
 
     def run():
-        for step in range(num_steps):
-            items = [(r, s.resize) for s in streams for r in s.batch_records(step)]
-            out = list(pool.map(decode_one, items))
-            x = np.stack([o[0] for o in out]).reshape(len(streams), -1, 224, 224, 3)
-            y = np.array([o[1] for o in out], np.int32).reshape(len(streams), -1)
-            q.put((x, y))
-        q.put(None)
+        try:
+            for step in range(num_steps):
+                items = [(r, s.resize) for s in streams for r in s.batch_records(step)]
+                out = list(pool.map(decode_one, items))
+                x = np.stack([o[0] for o in out]).reshape(len(streams), -1, 224, 224, 3)
+                y = np.array([o[1] for o in out], np.int32).reshape(len(streams), -1)
+                q.put((x, y))
+            q.put(None)
+        except BaseException as exc:  # surface loader errors instead of hanging the consumer
+            q.put(exc)
 
     threading.Thread(target=run, daemon=True).start()
     while (item := q.get()) is not None:
+        if isinstance(item, BaseException):
+            raise item
         yield item
 
 
@@ -184,4 +189,5 @@ class ConcatStream:
         self.resize = segments[0].resize
 
     def batch_records(self, step):
-        return self.segments[step // self.steps_each].batch_records(step % self.steps_each)
+        """Segments repeat in order if more steps are asked for than they hold."""
+        return self.segments[(step // self.steps_each) % len(self.segments)].batch_records(step % self.steps_each)

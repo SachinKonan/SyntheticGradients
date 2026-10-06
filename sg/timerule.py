@@ -63,6 +63,8 @@ def apply(kind, knobs, state, bn, g, bn_source, lr, mult):
         eta, anchor = jnp.exp(k["log_eta"]) * mult, jnp.exp(k["log_anchor"])
         avg[n] = jax.tree.map(lambda a, gg: b1 * a + (1 - b1) * gg, state["avg"][n], g[n])
         sq[n] = jax.tree.map(lambda s, gg: b2 * s + (1 - b2) * gg * gg, state["sq"][n], g[n])
-        step = jax.tree.map(lambda a, s: (a / (1 - b1 ** t)) / (jnp.sqrt(s / (1 - b2 ** t)) + EPS), avg[n], sq[n])
+        # sqrt has an infinite derivative at 0 (exactly-zero gradients), so keep it off zero.
+        step = jax.tree.map(lambda a, s: (a / (1 - b1 ** t)) / (jnp.sqrt(s / (1 - b2 ** t) + EPS ** 2) + EPS),
+                            avg[n], sq[n])
         new_bn[n] = jax.tree.map(lambda w, d, w0: w - eta * d - anchor * (w - w0), bn[n], step, bn_source[n])
     return new_bn, {"avg": avg, "sq": sq, "t": t}

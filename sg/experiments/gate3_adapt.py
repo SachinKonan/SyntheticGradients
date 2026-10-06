@@ -46,7 +46,7 @@ import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from sg import feedback, tent
+from sg import feedback, tent, timerule
 from sg.data import imagenet
 from sg.experiments import streams as st
 from sg.experiments.gate2_grid import unflatten
@@ -156,7 +156,7 @@ def main():
     bn0 = tent.bn_params(params)
 
     params_np = resnet.load_torchvision(st.fetch_file(args.weights, cache))[0]
-    recs = {}
+    recs, rules = {}, {}  # rules: name -> (time-rule kind, knobs); momentum otherwise
     for item in filter(None, args.predictors.split(",")):
         name, url = item.split("=")
         meta = json.loads(Path(st.fetch_file(url.removesuffix(".npz") + ".json", cache)).read_text())
@@ -166,7 +166,12 @@ def main():
                     "lowrank": lambda: feedback.init_lowrank(params_np, meta["lowrank_frac"]),
                     "precond": lambda: feedback.init_precond(params_np)}[arch]()
         recs[name] = sm.replicate(unflatten(template, load_npz(url, cache)))
-        log(f"predictor {name}: {arch} {meta.get('config')}")
+        kind = meta.get("time_rule", "momentum")
+        if kind != "momentum":  # learned time rule saved next to the predictor
+            knob_template = timerule.init_knobs(kind, eta={n: 1.0 for n in resnet.bn_names()})
+            rules[name] = (kind, sm.replicate(unflatten(knob_template, load_npz(
+                url.removesuffix("predictor.npz") + "time_rule.npz", cache))))
+        log(f"predictor {name}: {arch} {meta.get('config')}, time rule {kind}")
     for m in methods:  # untrained low-rank backward, from the SVD of the real convs
         name = m.split("@")[0]
         if name.startswith("lowrank") and name not in recs:
@@ -191,6 +196,7 @@ def main():
     # ------------------------------------------------------------ one jitted step per method
     def make_step(method):
         rec = recs.get(method.split("@")[0])
+        kind, knobs = rules.get(method.split("@")[0], ("momentum", {}))
 
         @functools.partial(jax.jit, donate_argnums=(0, 1), out_shardings=(traj_shard, traj_shard, traj_shard))
         def step(bn, velocity, x, y):
@@ -205,7 +211,7 @@ def main():
                     grads = resnet.bn_grads(deltas, sig[3])
                     if rec is not None and feedback.is_precond(rec):
                         grads = feedback.apply_precond(rec, grads)
-                    new_bn, new_vel = tent.sgd_momentum(bn_s, grads, vel_s, args.lr * mult, args.momentum)
+                    new_bn, new_vel = timerule.apply(kind, knobs, vel_s, bn_s, grads, bn0, args.lr, mult)
                     ok = jnp.all(jnp.stack([jnp.all(jnp.isfinite(a)) for a in jax.tree.leaves(new_bn)]))
                     keep = lambda a, b: jax.tree.map(lambda u, v: jnp.where(ok, u, v), a, b)
                     return keep(new_bn, bn_s), keep(new_vel, vel_s), jnp.stack([correct, 1 - ok.astype(jnp.int32)])
@@ -220,7 +226,12 @@ def main():
     steps = {m: make_step(m) for m in methods}
     fresh = jax.jit(lambda bn0: jax.tree.map(lambda a: jnp.broadcast_to(a, (len(mults), S) + a.shape), bn0),
                     out_shardings=traj_shard)
-    state = {m: (fresh(bn0), jax.tree.map(jnp.zeros_like, fresh(bn0))) for m in methods}
+    def fresh_rule(m):
+        kind = rules.get(m.split("@")[0], ("momentum", {}))[0]
+        init = jax.vmap(jax.vmap(lambda b: timerule.init_state(kind, b)))
+        return jax.jit(init, out_shardings=traj_shard)(fresh(bn0))
+
+    state = {m: (fresh(bn0), fresh_rule(m)) for m in methods}
     totals = {m: np.zeros((len(mults), S, 2), np.int64) for m in methods}
     seg_correct = {m: np.zeros((len(mults), S, n_seg), np.int64) for m in methods}  # by position in sequence
     ref_total = np.zeros((S, 2), np.int64)

@@ -23,6 +23,13 @@ epoch e is the entry at e x len / epochs). --loss-on all averages the label loss
 over every batch after an update (each scored before its own update), as in
 learned-optimizer training, instead of only the batch after the last update.
 
+Across batches, --time-rule momentum is Tent's SGD with momentum; filter is a
+learned diagonal filter with memory (sg.timerule: running gradient and gradient
+size, anchor to the source model, four learned knobs per BN layer, trained here
+with the same outer gradient). --freeze-predictor trains only the time rule.
+--switching-segment N makes every training stream switch to another fit
+corruption/severity every N batches, so the rule sees shifts while it learns.
+
 Data: the 4 fit corruptions on even val ids (as for imitation training). After
 every epoch the predictor is scored by deployment on the fit corruptions on odd
 ids: online error over --eval-steps batches per stream, at the learned step.
@@ -39,7 +46,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from sg import feedback, tent
+from sg import feedback, tent, timerule
 from sg.data import imagenet
 from sg.experiments import streams as st
 from sg.experiments.gate2_grid import flatten, unflatten
@@ -66,6 +73,25 @@ def load_predictor(url, params_np, cache):
     return unflatten(template, dict(np.load(st.fetch_file(url, cache)))), meta
 
 
+def calibrate(params, stats, bn0, phi, train, sm, args):
+    """Per-BN-layer initial filter steps that match momentum SGD at the starting multiplier,
+    from the predictor's gradients on the first training batch of every stream."""
+    def mean_sq(x_s):
+        p = {**params, **bn0}
+        sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy)
+        deltas = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
+                                              sig.deltas, exact_top=args.exact_top,
+                                              **feedback.predictor_kwargs(phi, sig.inv_stds))
+        g = resnet.bn_grads(deltas, sig.x_hats)
+        return jnp.stack([jnp.mean(jnp.square(jnp.concatenate([g[n]["scale"], g[n]["bias"]])))
+                          for n in resnet.bn_names()])
+
+    x, _ = next(st.prefetch_batches(train, 1, args.decode_workers))
+    ms = sm.gather(jax.jit(jax.vmap(mean_sq), out_shardings=sm.shard)(sm.put(x))).mean(0)  # (BNs,)
+    return {n: args.lr * args.init_mult * float(np.sqrt(v)) / (1 - timerule.MOMENTUM) + 1e-12
+            for n, v in zip(resnet.bn_names(), ms)}
+
+
 def cosine(a, b):
     return jnp.dot(a, b) / (jnp.sqrt(jnp.sum(a * a) + 1e-36) * jnp.sqrt(jnp.sum(b * b) + 1e-36))
 
@@ -83,6 +109,11 @@ def main():
     ap.add_argument("--remat", action="store_true", help="recompute steps in the outer backward (on for K >= 8)")
     ap.add_argument("--unroll-schedule", default="", help="e.g. 1,2,4,8,16: K grows over the epochs")
     ap.add_argument("--fresh", action="store_true", help="every unroll starts from the original model")
+    ap.add_argument("--time-rule", default="momentum", choices=["momentum", "filter"])
+    ap.add_argument("--knob-lr", type=float, default=1e-2, help="Adam lr of the time-rule knobs")
+    ap.add_argument("--freeze-predictor", action="store_true", help="train only the time rule (and step)")
+    ap.add_argument("--switching-segment", type=int, default=0,
+                    help="training streams switch corruption/severity every N batches (0: one per stream)")
     ap.add_argument("--meta-lr", type=float, default=3e-5)
     ap.add_argument("--step-lr", type=float, default=1e-2, help="Adam lr of the log step multiplier")
     ap.add_argument("--imitation", type=float, default=0.1)
@@ -112,6 +143,24 @@ def main():
                          resize=imagenet.needs_resize(spec[0]))
 
     train = [stream(specs[s], fit_ids) for s in sm.local_ids]
+    groups = sorted({g for g, _ in specs})
+    if args.switching_segment:
+        loaded = {g: stream((g, 0), fit_ids) for g in groups}
+
+        def switching_streams(epoch):
+            """Each stream: a random sequence of fit groups, N batches each, no reset in between."""
+            out = []
+            for spec_id in sm.local_ids:
+                rng = np.random.default_rng([epoch, spec_id, 17] + ([args.seed] if args.seed else []))
+                segs = []
+                for j, gi in enumerate(rng.permutation(len(groups))):
+                    v = st.Stream.__new__(st.Stream)
+                    v.records, v.batch, v.resize = loaded[groups[gi]].records, args.batch, False
+                    v.perm = np.random.default_rng([epoch, spec_id, j]).permutation(len(v.records))
+                    v.num_steps = len(v.records) // args.batch
+                    segs.append(v)
+                out.append(st.ConcatStream(segs, args.switching_segment))
+            return out
     val = [stream(specs[s], test_ids) for s in sm.local_ids]
     params_np, stats_np = resnet.load_torchvision(st.fetch_file(args.weights, cache))
     params, stats = sm.replicate((params_np, stats_np))
@@ -119,12 +168,19 @@ def main():
     phi0, meta = load_predictor(args.predictor, params_np, cache)
     log(f"{S} streams, predictor {meta.get('arch')} {meta.get('config')}, exact top {args.exact_top}, "
         f"K={k_schedule}, loss on {args.loss_on}, {'fresh' if args.fresh else 'carried'} start, "
-        f"meta-lr {args.meta_lr}, imitation {args.imitation}, start step x{args.init_mult}")
+        f"meta-lr {args.meta_lr}, imitation {args.imitation}, start step x{args.init_mult}, "
+        f"time rule {args.time_rule}{' (predictor frozen)' if args.freeze_predictor else ''}, "
+        f"switching every {args.switching_segment or 'never'}")
 
     zeros_like = lambda t: jax.tree.map(np.zeros_like, t)
+    knobs0 = timerule.init_knobs("momentum")
+    if args.time_rule == "filter":  # initial steps matched to momentum SGD at the starting multiplier
+        knobs0 = timerule.init_knobs("filter", eta=calibrate(params, stats, bn0, phi0, train, sm, args))
     state = {"phi": phi0, "log_mult": np.float32(np.log(args.init_mult)),
              "opt_phi": {"t": np.zeros((), np.int32), "m": zeros_like(phi0), "v": zeros_like(phi0)},
-             "opt_step": {"t": np.zeros((), np.int32), "m": np.float32(0), "v": np.float32(0)}}
+             "opt_step": {"t": np.zeros((), np.int32), "m": np.float32(0), "v": np.float32(0)},
+             "knobs": knobs0,
+             "opt_knobs": {"t": np.zeros((), np.int32), "m": zeros_like(knobs0), "v": zeros_like(knobs0)}}
     history, start_epoch = [], 0
     meta_ckpt = st.read_output(args.out, "ckpt/meta.json")
     if meta_ckpt is not None:
@@ -137,7 +193,7 @@ def main():
     @functools.partial(jax.jit, out_shardings=sm.shard)
     def fresh(bn0):
         bn = jax.tree.map(lambda a: jnp.broadcast_to(a, (S,) + a.shape), bn0)
-        return bn, jax.tree.map(jnp.zeros_like, bn)
+        return bn, jax.vmap(lambda b: timerule.init_state(args.time_rule, b))(bn)
 
     def predicted_grads(phi, bn_s, x_s):
         """Predictor's BN gradient at the current state; every ResNet quantity is stop-gradient."""
@@ -158,11 +214,10 @@ def main():
         logits, _ = resnet.apply({**params, **bn_s}, stats, imagenet.normalize(x), batch_stats=True)
         return jnp.mean(jax.nn.logsumexp(logits, -1) - jnp.take_along_axis(logits, y[:, None], -1)[:, 0]), logits
 
-    def one_update(phi, step, bn_s, vel_s, x):
+    def one_update(phi, knobs, mult, bn_s, rule_s, x):
         g, mis, logits = predicted_grads(phi, bn_s, x)
-        vel_s = jax.tree.map(lambda v, gg: args.momentum * v + gg, vel_s, g)
-        bn_s = jax.tree.map(lambda b, v: b - step * v, bn_s, vel_s)
-        return bn_s, vel_s, mis, logits
+        bn_s, rule_s = timerule.apply(args.time_rule, knobs, rule_s, bn_s, g, bn0, args.lr, mult)
+        return bn_s, rule_s, mis, logits
 
     def make_outer_step(K):
         """The jitted outer step for unrolls of length K."""
@@ -173,11 +228,13 @@ def main():
         def unroll_loss(trainable, bn_s, vel_s, xs, ys):
             """K predictor-driven updates; label loss on the batch after the last update (--loss-on last)
             or the mean over every batch after an update, each scored before its own update (all)."""
-            phi, log_mult = trainable["phi"], trainable["log_mult"]
-            step = args.lr * jnp.exp(log_mult)
+            phi, knobs = trainable["phi"], trainable["knobs"]
+            if args.freeze_predictor:
+                phi = sg_(phi)
+            mult = jnp.exp(trainable["log_mult"]) if args.time_rule == "momentum" else 1.0  # filter: eta is a knob
             imit, correct, ce_sum = 0.0, 0, 0.0
             for t in range(K):
-                bn_s, vel_s, mis, logits = update_fn(phi, step, bn_s, vel_s, xs[t])
+                bn_s, vel_s, mis, logits = update_fn(phi, knobs, mult, bn_s, vel_s, xs[t])
                 correct += jnp.sum(logits.argmax(-1) == ys[t])
                 imit += mis / K
                 if args.loss_on == "all" or t == K - 1:
@@ -189,35 +246,40 @@ def main():
 
         @functools.partial(jax.jit, donate_argnums=(0, 1, 2), out_shardings=(sm.shard, sm.shard, sm.repl, sm.repl))
         def outer_step(bn, vel, state, xs, ys):
-            trainable = {"phi": state["phi"], "log_mult": state["log_mult"]}
+            trainable = {"phi": state["phi"], "log_mult": state["log_mult"], "knobs": state["knobs"]}
             grad_fn = jax.value_and_grad(unroll_loss, has_aux=True)
             (_, (bn, vel, ce, imit, correct)), grads = jax.vmap(
                 grad_fn, in_axes=(None, 0, 0, 0, 0))(trainable, bn, vel, xs, ys)  # xs: (streams, K+1, B, ...)
             grads = jax.tree.map(lambda a: a.mean(0), grads)
             phi, opt_phi, gnorm = adam(state["phi"], grads["phi"], state["opt_phi"], args.meta_lr)
             log_mult, opt_step, _ = adam(state["log_mult"], grads["log_mult"], state["opt_step"], args.step_lr)
-            new = {"phi": phi, "log_mult": log_mult, "opt_phi": opt_phi, "opt_step": opt_step}
+            knobs, opt_knobs, knob_norm = adam(state["knobs"], grads["knobs"], state["opt_knobs"], args.knob_lr)
+            if args.freeze_predictor:
+                phi, opt_phi = state["phi"], state["opt_phi"]
+            new = {"phi": phi, "log_mult": log_mult, "opt_phi": opt_phi, "opt_step": opt_step,
+                   "knobs": knobs, "opt_knobs": opt_knobs}
             return bn, vel, new, {"ce": ce.mean(), "imitation": imit.mean(), "correct": correct.sum(),
-                                  "grad_norm": gnorm, "mult": jnp.exp(log_mult)}
+                                  "grad_norm": knob_norm if args.freeze_predictor else gnorm,
+                                  "mult": jnp.exp(log_mult)}
 
         return outer_step
 
     outer_steps = {}  # one compiled outer step per K
 
     @functools.partial(jax.jit, donate_argnums=(0, 1), out_shardings=(sm.shard, sm.shard, sm.shard))
-    def deploy_step(bn, vel, x, y, phi, log_mult):
-        def one(bn_s, vel_s, x_s, y_s):
-            g, _, logits = predicted_grads(phi, bn_s, x_s)
-            vel_s = jax.tree.map(lambda v, gg: args.momentum * v + gg, vel_s, g)
-            bn_s = jax.tree.map(lambda b, v: b - args.lr * jnp.exp(log_mult) * v, bn_s, vel_s)
-            return bn_s, vel_s, jnp.sum(logits.argmax(-1) == y_s)
+    def deploy_step(bn, vel, x, y, phi, log_mult, knobs):
+        mult = jnp.exp(log_mult) if args.time_rule == "momentum" else 1.0
+
+        def one(bn_s, rule_s, x_s, y_s):
+            bn_s, rule_s, _, logits = one_update(phi, knobs, mult, bn_s, rule_s, x_s)
+            return bn_s, rule_s, jnp.sum(logits.argmax(-1) == y_s)
         return jax.vmap(one)(bn, vel, x, y)
 
     def evaluate(tag):
         bn, vel = fresh(bn0)
         correct = np.zeros(S)
         for x, y in st.prefetch_batches(val, args.eval_steps, args.decode_workers):
-            bn, vel, c = deploy_step(bn, vel, sm.put(x), sm.put(y), state["phi"], state["log_mult"])
+            bn, vel, c = deploy_step(bn, vel, sm.put(x), sm.put(y), state["phi"], state["log_mult"], state["knobs"])
             correct += sm.gather(c)
         err = 100 * (1 - correct.sum() / (S * args.eval_steps * args.batch))
         mult = float(np.exp(jax.device_get(state["log_mult"])))
@@ -243,12 +305,13 @@ def main():
         for s, spec_id in zip(train, sm.local_ids):
             key = [epoch, specs[spec_id][1], spec_id] + ([args.seed] if args.seed else [])
             s.perm = np.random.default_rng(key).permutation(len(s.records))
+        epoch_streams = switching_streams(epoch) if args.switching_segment else train
         K = k_for_epoch(epoch)
         if K not in outer_steps:
             outer_steps[K] = make_outer_step(K)
         outer_per_epoch = (steps_per_epoch - 1) // K
         bn, vel = fresh(bn0)
-        batches = st.prefetch_batches(train, outer_per_epoch * K + 1, args.decode_workers)
+        batches = st.prefetch_batches(epoch_streams, outer_per_epoch * K + 1, args.decode_workers)
         x_prev, y_prev = next(batches)
         for i in range(outer_per_epoch):
             window = [(x_prev, y_prev)] + [next(batches) for _ in range(K)]
@@ -273,10 +336,14 @@ def main():
         buf = io.BytesIO()
         np.savez(buf, **flatten(host["phi"]))
         st.write_output(args.out, "predictor.npz", buf.getvalue())
+        if args.time_rule != "momentum":
+            buf = io.BytesIO()
+            np.savez(buf, **flatten(host["knobs"]))
+            st.write_output(args.out, "time_rule.npz", buf.getvalue())
         mult = float(np.exp(host["log_mult"]))
         st.write_output(args.out, "predictor.json", json.dumps(
             {**meta, "kind": "predictor", "phase_c": vars(args), "learned_mult": mult,
-             "source_predictor": args.predictor}).encode())
+             "time_rule": args.time_rule, "source_predictor": args.predictor}).encode())
         st.write_output(args.out, "results.json", json.dumps({"config": vars(args), "history": history,
                                                               "learned_mult": mult}).encode())
         log(f"done; learned step x{mult:.3f}")
