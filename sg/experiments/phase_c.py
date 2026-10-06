@@ -45,6 +45,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from sg import feedback, tent, timerule
 from sg.data import imagenet
@@ -97,7 +98,7 @@ def calibrate(params, stats, bn0, phi, train, sm, args):
         return jnp.stack([jnp.mean(jnp.square(flatten_grads(g, [n]))) for n in sorted(bn0)])
 
     x, _ = next(st.prefetch_batches(train, 1, args.decode_workers))
-    ms = sm.gather(jax.jit(jax.vmap(mean_sq), out_shardings=sm.shard)(sm.put(x, 1))).mean(0)  # (BNs,)
+    ms = sm.gather(jax.jit(jax.vmap(mean_sq, spmd_axis_name="streams"), out_shardings=sm.shard)(sm.put(x, 1))).mean(0)  # (BNs,)
     return {n: args.lr * args.init_mult * float(np.sqrt(v)) / (1 - timerule.MOMENTUM) + 1e-12
             for n, v in zip(sorted(bn0), ms)}
 
@@ -130,6 +131,10 @@ def main():
     ap.add_argument("--step-lr", type=float, default=1e-2, help="Adam lr of the log step multiplier")
     ap.add_argument("--imitation", type=float, default=0.1)
     ap.add_argument("--epochs", type=int, default=8)
+    ap.add_argument("--updates", type=int, default=None,
+                    help="stop after this many predictor updates (overrides --epochs; may end mid-epoch)")
+    ap.add_argument("--freeze-eta", action="store_true",
+                    help="filter: keep each layer's step at its calibrated start; learn only b1, b2, anchor")
     ap.add_argument("--seed", type=int, default=0, help="training stream order (0 reproduces earlier runs)")
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2.5e-4, help="Tent's step size")
@@ -152,6 +157,8 @@ def main():
     k_schedule = [int(k) for k in args.unroll_schedule.split(",")] if args.unroll_schedule else [args.unroll]
     k_for_epoch = lambda e: k_schedule[min(e * len(k_schedule) // args.epochs, len(k_schedule) - 1)]
     sm = st.StreamMesh(S, args.batch_split)
+    if args.batch_split > 1:  # keep every activation split over the stream's devices
+        resnet.shard_batch(NamedSharding(sm.mesh, P("batch")))
     cache = Path(args.local_cache)
 
     def stream(spec, keep):
@@ -200,12 +207,12 @@ def main():
              "opt_step": {"t": np.zeros((), np.int32), "m": np.float32(0), "v": np.float32(0)},
              "knobs": knobs0,
              "opt_knobs": {"t": np.zeros((), np.int32), "m": zeros_like(knobs0), "v": zeros_like(knobs0)}}
-    history, start_epoch = [], 0
+    history, start_epoch, updates_done = [], 0, 0
     meta_ckpt = st.read_output(args.out, "ckpt/meta.json")
     if meta_ckpt is not None:
         m = json.loads(meta_ckpt)
         state = unflatten(state, dict(np.load(io.BytesIO(st.read_output(args.out, "ckpt/state.npz")))))
-        history, start_epoch = m["history"], m["epochs_done"]
+        history, start_epoch, updates_done = m["history"], m["epochs_done"], m.get("updates_done", 0)
         log(f"resumed after epoch {start_epoch}")
     state = sm.replicate(state)
 
@@ -248,6 +255,8 @@ def main():
             """K predictor-driven updates; label loss on the batch after the last update (--loss-on last)
             or the mean over every batch after an update, each scored before its own update (all)."""
             phi, knobs = trainable["phi"], trainable["knobs"]
+            if args.freeze_eta:
+                knobs = {n: {**k, "log_eta": sg_(k["log_eta"])} for n, k in knobs.items()}
             if args.freeze_predictor:
                 phi = sg_(phi)
             mult = jnp.exp(trainable["log_mult"]) if args.time_rule == "momentum" else 1.0  # filter: eta is a knob
@@ -268,7 +277,7 @@ def main():
             trainable = {"phi": state["phi"], "log_mult": state["log_mult"], "knobs": state["knobs"]}
             grad_fn = jax.value_and_grad(unroll_loss, has_aux=True)
             (_, (bn, vel, ce, imit, correct)), grads = jax.vmap(
-                grad_fn, in_axes=(None, 0, 0, 0, 0))(trainable, bn, vel, xs, ys)  # xs: (streams, K+1, B, ...)
+                grad_fn, in_axes=(None, 0, 0, 0, 0), spmd_axis_name="streams")(trainable, bn, vel, xs, ys)  # xs: (streams, K+1, B, ...)
             grads = jax.tree.map(lambda a: a.mean(0), grads)
             phi, opt_phi, gnorm = adam(state["phi"], grads["phi"], state["opt_phi"], args.meta_lr)
             log_mult, opt_step, _ = adam(state["log_mult"], grads["log_mult"], state["opt_step"], args.step_lr)
@@ -292,7 +301,7 @@ def main():
         def one(bn_s, rule_s, x_s, y_s):
             bn_s, rule_s, _, logits = one_update(phi, knobs, mult, bn_s, rule_s, x_s)
             return bn_s, rule_s, jnp.sum(logits.argmax(-1) == y_s)
-        return jax.vmap(one)(bn, vel, x, y)
+        return jax.vmap(one, spmd_axis_name="streams")(bn, vel, x, y)
 
     def evaluate(tag):
         bn, vel = fresh(bn0)
@@ -312,15 +321,18 @@ def main():
             np.savez(buf, **flatten(host))
             st.write_output(args.out, "ckpt/state.npz", buf.getvalue())
             st.write_output(args.out, "ckpt/meta.json", json.dumps(
-                {"epochs_done": epochs_done, "history": history}).encode())
+                {"epochs_done": epochs_done, "updates_done": updates_done, "history": history}).encode())
 
     steps_per_epoch = st.common_steps(train)
     if args.steps:
         steps_per_epoch = min(steps_per_epoch, args.steps)
     if start_epoch == 0:
         evaluate("start")
-    t0, n = time.time(), 0
-    for epoch in range(start_epoch, args.epochs):
+    t0, n, data_wait = time.time(), 0, 0.0  # data_wait: seconds blocked on image loading
+    assert not (args.updates and args.unroll_schedule), "--updates needs a fixed K"
+    for epoch in range(start_epoch, 10 ** 6 if args.updates else args.epochs):
+        if args.updates and updates_done >= args.updates:
+            break
         for s, spec_id in zip(train, sm.local_ids):
             key = [epoch, specs[spec_id][1], spec_id] + ([args.seed] if args.seed else [])
             s.perm = np.random.default_rng(key).permutation(len(s.records))
@@ -329,11 +341,15 @@ def main():
         if K not in outer_steps:
             outer_steps[K] = make_outer_step(K)
         outer_per_epoch = (steps_per_epoch - 1) // K
+        if args.updates:
+            outer_per_epoch = min(outer_per_epoch, args.updates - updates_done)
         bn, vel = fresh(bn0)
         batches = st.prefetch_batches(epoch_streams, outer_per_epoch * K + 1, args.decode_workers)
         x_prev, y_prev = next(batches)
         for i in range(outer_per_epoch):
+            tw = time.time()
             window = [(x_prev, y_prev)] + [next(batches) for _ in range(K)]
+            data_wait += time.time() - tw
             xs = np.stack([w[0] for w in window], axis=1)  # (local streams, K+1, B, ...)
             ys = np.stack([w[1] for w in window], axis=1)
             if args.fresh:
@@ -341,10 +357,11 @@ def main():
             bn, vel, state, info = outer_steps[K](bn, vel, state, sm.put(xs, 2), sm.put(ys, 2))
             x_prev, y_prev = window[-1]  # the scored batch is the next unroll's first batch
             n += 1
+            updates_done += 1
             if i % 20 == 0 or i + 1 == outer_per_epoch:
                 info = jax.device_get(info)
                 err = 100 * (1 - info["correct"] / (S * (K + 1) * args.batch))
-                log(f"epoch {epoch} K={K} outer {i + 1}/{outer_per_epoch} {(time.time() - t0) / n:.2f}s/step  "
+                log(f"epoch {epoch} K={K} outer {i + 1}/{outer_per_epoch} {(time.time() - t0) / n:.2f}s/step ({100 * data_wait / (time.time() - t0):.0f}% waiting on data)  "
                     f"ce {info['ce']:.3f}  imitation {info['imitation']:.3f}  online err {err:.1f}  "
                     f"step x{info['mult']:.2f}  |grad| {info['grad_norm']:.2e}")
         evaluate(f"epoch {epoch + 1}")

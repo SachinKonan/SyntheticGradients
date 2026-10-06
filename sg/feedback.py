@@ -297,7 +297,7 @@ def predictor_kwargs(pred, inv_stds):
 def _bn_backward(params, x_hats, inv_stds, name, dy):
     """dL/dx of a batch-statistics BN given dL/dy (exact, cheap)."""
     x_hat, mean = x_hats[name], lambda a: jnp.mean(a, axis=(0, 1, 2))
-    return params[name]["scale"] * inv_stds[name] * (dy - mean(dy) - x_hat * mean(dy * x_hat))
+    return resnet.pin(params[name]["scale"] * inv_stds[name] * (dy - mean(dy) - x_hat * mean(dy * x_hat)))
 
 
 def _lowrank_branch(params, x_hats, inv_stds, lr, pre, stride, g):

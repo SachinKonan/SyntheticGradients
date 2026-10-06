@@ -49,17 +49,33 @@ def load_torchvision(path: str) -> tuple[dict, dict]:
     return params, stats
 
 
+_batch_sharding = None
+
+
+def shard_batch(sharding):
+    """Pin the batch axis of every activation to `sharding` (e.g. NamedSharding(mesh, P("batch")))
+    in code traced from now on, so a stream's batch stays split over its devices instead of
+    being left to XLA's guess. Per-stream code must then be vmapped with spmd_axis_name.
+    None turns it off."""
+    global _batch_sharding
+    _batch_sharding = sharding
+
+
+def pin(x):
+    return x if _batch_sharding is None else jax.lax.with_sharding_constraint(x, _batch_sharding)
+
+
 def conv(p, x, stride=1):
     k = p["w"].shape[0]
     if k == 1:
         # A 1x1 conv is a per-pixel matmul. As an einsum it also shards correctly when every
         # stream carries its own weights (vmapped lax.conv kernels gave wrong sharded results).
         x = x[:, ::stride, ::stride, :] if stride > 1 else x
-        return jnp.einsum("nhwc,cd->nhwd", x, p["w"][0, 0])
+        return pin(jnp.einsum("nhwc,cd->nhwd", x, p["w"][0, 0]))
     pad = (k - 1) // 2
-    return jax.lax.conv_general_dilated(
+    return pin(jax.lax.conv_general_dilated(
         x, p["w"], (stride, stride), [(pad, pad), (pad, pad)],
-        dimension_numbers=("NHWC", "HWIO", "NHWC"))
+        dimension_numbers=("NHWC", "HWIO", "NHWC")))
 
 
 def batchnorm(p, s, x, batch_stats):
@@ -70,8 +86,8 @@ def batchnorm(p, s, x, batch_stats):
     else:
         mean, var = s["mean"], s["var"]
     inv_std = jax.lax.rsqrt(var + BN_EPS)
-    x_hat = (x - mean) * inv_std
-    return x_hat * p["scale"] + p["bias"], x_hat, inv_std
+    x_hat = pin((x - mean) * inv_std)
+    return pin(x_hat * p["scale"] + p["bias"]), x_hat, inv_std
 
 
 def maxpool(x):

@@ -388,7 +388,15 @@ def test_split_batch_matches_one_device():
         f = jax.jit(jax.vmap(per_stream, in_axes=(None, 0, 0)))
         ref = f(phi, convs, x)
         sm = st.StreamMesh(2, batch_split=2)
-        out = f(sm.replicate(phi), jax.device_put(convs, sm.shard), sm.put(np.asarray(x), 1))
-        assert out[0].sharding.spec[0] == "streams"
-        for a, b in zip(jax.tree.leaves(out), jax.tree.leaves(ref)):
-            np.testing.assert_allclose(a, b, rtol=1e-9, atol=1e-12 * float(jnp.abs(b).max()))
+        args = (sm.replicate(phi), jax.device_put(convs, sm.shard), sm.put(np.asarray(x), 1))
+        outs = [f(*args)]  # XLA's own choice of sharding
+        from jax.sharding import NamedSharding, PartitionSpec as P
+        resnet.shard_batch(NamedSharding(sm.mesh, P("batch")))  # every activation pinned (phase_c)
+        try:
+            outs.append(jax.jit(jax.vmap(per_stream, in_axes=(None, 0, 0), spmd_axis_name="streams"))(*args))
+        finally:
+            resnet.shard_batch(None)
+        for out in outs:
+            assert out[0].sharding.spec[0] == "streams"
+            for a, b in zip(jax.tree.leaves(out), jax.tree.leaves(ref)):
+                np.testing.assert_allclose(a, b, rtol=1e-9, atol=1e-12 * float(jnp.abs(b).max()))
