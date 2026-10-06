@@ -84,7 +84,8 @@ def main():
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--mults", default="0.3,1,3,10,30,100")
     ap.add_argument("--predictors", default="A=gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k0best.npz,"
-                                            "B=gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k1best.npz")
+                                            "B=gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k1best.npz",
+                    help="name=url,...; 'none' for no trained predictors")
     ap.add_argument("--dfa", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/dfa_fit.npz")
     ap.add_argument("--rank", type=int, default=64)
     ap.add_argument("--methods", default="tent,shortcut@0,shortcut@1,shortcut@2,shortcut@4,dfa,"
@@ -163,7 +164,7 @@ def main():
 
     params_np = resnet.load_torchvision(st.fetch_file(args.weights, cache))[0]
     recs, rules = {}, {}  # rules: name -> (time-rule kind, knobs); momentum otherwise
-    for item in filter(None, args.predictors.split(",")):
+    for item in [i for i in args.predictors.split(",") if i and i != "none"]:
         name, url = item.split("=")
         meta = json.loads(Path(st.fetch_file(url.removesuffix(".npz") + ".json", cache)).read_text())
         arch = meta.get("arch", "recurrence")

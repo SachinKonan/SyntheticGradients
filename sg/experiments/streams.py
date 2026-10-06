@@ -100,27 +100,36 @@ def prefetch_batches(streams, num_steps, workers, depth=3):
 
 
 class StreamMesh:
-    """A 1-D device mesh over streams, and this host's share of them."""
+    """A device mesh over streams, and this host's share of them.
 
-    def __init__(self, num_streams: int):
-        devices = np.array(jax.devices())
-        assert num_streams % len(devices) == 0, f"{num_streams} streams for {len(devices)} devices"
+    batch_split > 1 spreads each stream's batch over that many devices (mesh axis
+    "batch"), for steps too big for one device; BN statistics and losses are still
+    over the full batch (XLA adds the cross-device sums)."""
+
+    def __init__(self, num_streams: int, batch_split: int = 1):
+        devices = np.array(jax.devices()).reshape(-1, batch_split)
+        assert num_streams % len(devices) == 0, f"{num_streams} streams for {len(devices)} device groups"
         self.num_streams = num_streams
-        mesh = Mesh(devices, ("streams",))
-        self.shard = NamedSharding(mesh, P("streams"))
-        self.repl = NamedSharding(mesh, P())
+        self.mesh = Mesh(devices, ("streams", "batch"))
+        self.shard = NamedSharding(self.mesh, P("streams"))
+        self.repl = NamedSharding(self.mesh, P())
         # Each local device holds a contiguous range of streams.
         ranges = {d: range(*sl[0].indices(num_streams))
                   for d, sl in self.shard.addressable_devices_indices_map((num_streams,)).items()}
-        self.local_ids = sorted(i for r in ranges.values() for i in r)
-        pos = {s: k for k, s in enumerate(self.local_ids)}
-        self._local_index = {d: slice(pos[r[0]], pos[r[-1]] + 1) for d, r in ranges.items()}
+        self.local_ids = sorted({i for r in ranges.values() for i in r})
+        self._pos = {s: k for k, s in enumerate(self.local_ids)}
 
-    def put(self, local: np.ndarray):
-        """Stream-sharded global array from this host's (local_streams, ...) slice."""
+    def put(self, local: np.ndarray, batch_axis: int | None = None):
+        """Stream-sharded global array from this host's (local_streams, ...) slice; with
+        batch_axis, that axis is also split over the mesh's "batch" axis."""
         shape = (self.num_streams,) + local.shape[1:]
-        arrays = [jax.device_put(local[self._local_index[d]], d) for d in self.shard.addressable_devices]
-        return jax.make_array_from_single_device_arrays(shape, self.shard, arrays)
+        sharding = self.shard if batch_axis is None else NamedSharding(
+            self.mesh, P("streams", *[None] * (batch_axis - 1), "batch"))
+        arrays = []
+        for d, idx in sharding.addressable_devices_indices_map(shape).items():
+            r = range(*idx[0].indices(self.num_streams))
+            arrays.append(jax.device_put(local[(slice(self._pos[r[0]], self._pos[r[-1]] + 1),) + tuple(idx[1:])], d))
+        return jax.make_array_from_single_device_arrays(shape, sharding, arrays)
 
     def replicate(self, tree):
         return jax.tree.map(

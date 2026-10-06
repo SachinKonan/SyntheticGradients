@@ -97,7 +97,7 @@ def calibrate(params, stats, bn0, phi, train, sm, args):
         return jnp.stack([jnp.mean(jnp.square(flatten_grads(g, [n]))) for n in sorted(bn0)])
 
     x, _ = next(st.prefetch_batches(train, 1, args.decode_workers))
-    ms = sm.gather(jax.jit(jax.vmap(mean_sq), out_shardings=sm.shard)(sm.put(x))).mean(0)  # (BNs,)
+    ms = sm.gather(jax.jit(jax.vmap(mean_sq), out_shardings=sm.shard)(sm.put(x, 1))).mean(0)  # (BNs,)
     return {n: args.lr * args.init_mult * float(np.sqrt(v)) / (1 - timerule.MOMENTUM) + 1e-12
             for n, v in zip(sorted(bn0), ms)}
 
@@ -137,17 +137,21 @@ def main():
     ap.add_argument("--eval-steps", type=int, default=100)
     ap.add_argument("--steps", type=int, default=None, help="cap batches per epoch (smoke tests)")
     ap.add_argument("--streams", type=int, default=None, help="first N streams (smoke tests)")
+    ap.add_argument("--batch-split", type=int, default=1,
+                    help="devices per stream (each splits the batch), for steps that do not fit on one; "
+                         "keeps every b-th training stream so the same devices suffice")
     args = ap.parse_args()
 
     st.init_distributed(args)
     lead = jax.process_index() == 0
     log = (lambda *a: print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)) if lead else (lambda *a: None)
 
-    specs = fit_specs()[: args.streams]
+    all_specs = fit_specs()[: args.streams]
+    specs = all_specs[:: args.batch_split]  # every corruption stays in
     S = len(specs)
     k_schedule = [int(k) for k in args.unroll_schedule.split(",")] if args.unroll_schedule else [args.unroll]
     k_for_epoch = lambda e: k_schedule[min(e * len(k_schedule) // args.epochs, len(k_schedule) - 1)]
-    sm = st.StreamMesh(S)
+    sm = st.StreamMesh(S, args.batch_split)
     cache = Path(args.local_cache)
 
     def stream(spec, keep):
@@ -155,7 +159,7 @@ def main():
                          resize=imagenet.needs_resize(spec[0]))
 
     train = [stream(specs[s], fit_ids) for s in sm.local_ids]
-    groups = sorted({g for g, _ in specs})
+    groups = sorted({g for g, _ in all_specs})
     if args.switching_segment:
         loaded = {g: stream((g, 0), fit_ids) for g in groups}
 
@@ -294,7 +298,7 @@ def main():
         bn, vel = fresh(bn0)
         correct = np.zeros(S)
         for x, y in st.prefetch_batches(val, args.eval_steps, args.decode_workers):
-            bn, vel, c = deploy_step(bn, vel, sm.put(x), sm.put(y), state["phi"], state["log_mult"], state["knobs"])
+            bn, vel, c = deploy_step(bn, vel, sm.put(x, 1), sm.put(y, 1), state["phi"], state["log_mult"], state["knobs"])
             correct += sm.gather(c)
         err = 100 * (1 - correct.sum() / (S * args.eval_steps * args.batch))
         mult = float(np.exp(jax.device_get(state["log_mult"])))
@@ -334,7 +338,7 @@ def main():
             ys = np.stack([w[1] for w in window], axis=1)
             if args.fresh:
                 bn, vel = fresh(bn0)
-            bn, vel, state, info = outer_steps[K](bn, vel, state, sm.put(xs), sm.put(ys))
+            bn, vel, state, info = outer_steps[K](bn, vel, state, sm.put(xs, 2), sm.put(ys, 2))
             x_prev, y_prev = window[-1]  # the scored batch is the next unroll's first batch
             n += 1
             if i % 20 == 0 or i + 1 == outer_per_epoch:

@@ -352,3 +352,43 @@ def test_conv1x1_grads_match_backprop(signals):
         for n in names:
             np.testing.assert_allclose(ours[n]["w"], ref[n]["w"], rtol=1e-8,
                                        atol=1e-12 * float(jnp.abs(ref[n]["w"]).max()), err_msg=n)
+
+
+def test_split_batch_matches_one_device():
+    """Phase C's outer gradient (conv mode, low-rank predictor) with each stream's batch split
+    over 2 devices (--batch-split 2) equals the unsharded result. Needs >= 4 devices, e.g.
+    XLA_FLAGS=--xla_force_host_platform_device_count=4."""
+    if len(jax.devices()) < 4:
+        pytest.skip("needs 4 devices")
+    if not os.path.exists(WEIGHTS):
+        pytest.skip(f"weights not found: {WEIGHTS}")
+    from sg.experiments import streams as st
+    names = feedback.conv1x1_names()
+    with jax.enable_x64(True):
+        params, stats = f64(resnet.load_torchvision(WEIGHTS))
+        phi = feedback.init_lowrank(params, 0.25)
+        key = jax.random.key(0)
+        convs = {n: {"w": params[n]["w"] * (1 + 0.01 * jax.random.normal(jax.random.fold_in(key, i), (2,) + params[n]["w"].shape))}
+                 for i, n in enumerate(names)}  # each of the 2 streams has its own 1x1 convs
+        x = jax.random.normal(jax.random.fold_in(key, 99), (2, 4, 64, 64, 3), jnp.float64)
+
+        def per_stream(phi, convs, x):
+            def loss(phi):
+                p = jax.lax.stop_gradient({**params, **convs})
+                sig = jax.lax.stop_gradient(feedback.exact_signals(p, stats, x, tent.entropy))
+                deltas = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
+                                                      sig.deltas, exact_top=1,
+                                                      **feedback.predictor_kwargs(phi, sig.inv_stds))
+                g = feedback.conv1x1_grads(p, sig.x_hats, sig.inv_stds, sig.block_io, deltas)
+                new = {n: {"w": convs[n]["w"] - 0.1 * g[n]["w"]} for n in names}
+                logits, _ = resnet.apply({**params, **new}, stats, x, batch_stats=True)
+                return tent.entropy(logits)
+            return jax.value_and_grad(loss)(phi)
+
+        f = jax.jit(jax.vmap(per_stream, in_axes=(None, 0, 0)))
+        ref = f(phi, convs, x)
+        sm = st.StreamMesh(2, batch_split=2)
+        out = f(sm.replicate(phi), jax.device_put(convs, sm.shard), sm.put(np.asarray(x), 1))
+        assert out[0].sharding.spec[0] == "streams"
+        for a, b in zip(jax.tree.leaves(out), jax.tree.leaves(ref)):
+            np.testing.assert_allclose(a, b, rtol=1e-9, atol=1e-12 * float(jnp.abs(b).max()))
