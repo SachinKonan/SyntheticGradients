@@ -332,3 +332,23 @@ def test_per_stream_1x1_conv_weights_shard_correctly():
     sh = NamedSharding(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("s",)), P("s"))
     out = f(jax.device_put(w, sh), jax.device_put(x, sh))
     np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_conv1x1_grads_match_backprop(signals):
+    """With exact deltas, the 1x1 conv gradients equal jax.grad of the entropy."""
+    params, stats, *_ = signals
+    with jax.enable_x64(True):
+        x = jax.random.normal(jax.random.key(0), (4, 96, 96, 3), jnp.float64)
+        sig = feedback.exact_signals(params, stats, x, tent.entropy)
+        ours = feedback.conv1x1_grads(params, sig.x_hats, sig.inv_stds, sig.block_io, sig.deltas)
+        names = feedback.conv1x1_names()
+        assert set(ours) == set(names) and len(names) == 36
+
+        def loss(convs):
+            logits, _ = resnet.apply({**params, **convs}, stats, x, batch_stats=True)
+            return tent.entropy(logits)
+
+        ref = jax.grad(loss)({n: params[n] for n in names})
+        for n in names:
+            np.testing.assert_allclose(ours[n]["w"], ref[n]["w"], rtol=1e-8,
+                                       atol=1e-12 * float(jnp.abs(ref[n]["w"]).max()), err_msg=n)

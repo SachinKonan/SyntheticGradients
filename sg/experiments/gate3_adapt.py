@@ -75,6 +75,9 @@ def main():
     ap = argparse.ArgumentParser()
     st.add_launch_args(ap)
     ap.add_argument("--set", required=True, choices=["val", "test", "continual", "r", "sketch", "v2"])
+    ap.add_argument("--adapt", default="bn", choices=["bn", "conv1x1"],
+                    help="what adapts: the 53 BN (scale, bias), or every 1x1 conv with BN frozen "
+                         "(then 'tent' is exact full-backprop fine-tuning of those convs)")
     ap.add_argument("--continual-images", type=int, default=5000, help="images per corruption (continual)")
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--lr", type=float, default=2.5e-4, help="Tent's step size; scaled by each multiplier")
@@ -153,7 +156,10 @@ def main():
         mask_logits = lambda l: l
     loss_fn = lambda logits: tent.entropy(mask_logits(logits))
     params, stats = sm.replicate(resnet.load_torchvision(st.fetch_file(args.weights, cache)))
-    bn0 = tent.bn_params(params)
+    # The adapted parameters ("bn0" below): BN affine params, or the 1x1 conv weights (BN frozen;
+    # BN still uses test-batch statistics, as for every method).
+    adapted_names = resnet.bn_names() if args.adapt == "bn" else feedback.conv1x1_names()
+    bn0 = {n: params[n] for n in adapted_names}
 
     params_np = resnet.load_torchvision(st.fetch_file(args.weights, cache))[0]
     recs, rules = {}, {}  # rules: name -> (time-rule kind, knobs); momentum otherwise
@@ -168,7 +174,7 @@ def main():
         recs[name] = sm.replicate(unflatten(template, load_npz(url, cache)))
         kind = meta.get("time_rule", "momentum")
         if kind != "momentum":  # learned time rule saved next to the predictor
-            knob_template = timerule.init_knobs(kind, eta={n: 1.0 for n in resnet.bn_names()})
+            knob_template = timerule.init_knobs(kind, eta={n: 1.0 for n in adapted_names}, names=adapted_names)
             rules[name] = (kind, sm.replicate(unflatten(knob_template, load_npz(
                 url.removesuffix("predictor.npz") + "time_rule.npz", cache))))
         log(f"predictor {name}: {arch} {meta.get('config')}, time rule {kind}")
@@ -208,7 +214,10 @@ def main():
                     sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), loss_fn)
                     correct = jnp.sum(mask_logits(sig[0]).argmax(-1) == y_s)  # scored before the update
                     deltas = method_deltas(method, rec, dfa_w, p, stats, sig)
-                    grads = resnet.bn_grads(deltas, sig[3])
+                    if args.adapt == "bn":
+                        grads = resnet.bn_grads(deltas, sig.x_hats)
+                    else:
+                        grads = feedback.conv1x1_grads(p, sig.x_hats, sig.inv_stds, sig.block_io, deltas)
                     if rec is not None and feedback.is_precond(rec):
                         grads = feedback.apply_precond(rec, grads)
                     new_bn, new_vel = timerule.apply(kind, knobs, vel_s, bn_s, grads, bn0, args.lr, mult)

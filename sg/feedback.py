@@ -415,6 +415,40 @@ def _branch_vjp(params, bn, pre, h_in, stride, g, x_hats):
     return vjp(g)
 
 
+# ----------------------------------------------------------------------------- 1x1 conv gradients
+
+def conv1x1_names() -> list[str]:
+    """Every 1x1 conv: conv1 and conv3 of each block, and the projection shortcuts."""
+    names = []
+    for pre, _, projection in resnet.blocks():
+        names += [f"{pre}.conv1", f"{pre}.conv3"] + ([f"{pre}.downsample.0"] if projection else [])
+    return names
+
+
+def conv1x1_grads(params, x_hats, inv_stds, block_io, deltas, names=None):
+    """Weight gradients of 1x1 convs from the error signals at the BNs that follow them.
+
+    A 1x1 conv z = x @ W feeds a batch-statistics BN; the error at z is that BN's
+    exact backward of its output error (cheap), and dL/dW = sum over pixels of x^T dz.
+    Inputs: conv1 reads the block input, conv3 reads relu(bn2), the projection
+    reads the (strided) block input. Exact deltas give the exact gradient.
+    """
+    names = set(names or conv1x1_names())
+    out = {}
+    for k, (pre, stride, projection) in enumerate(resnet.blocks()):
+        h_in = block_io[k][0]
+        sources = {f"{pre}.conv1": (h_in, f"{pre}.bn1"),
+                   f"{pre}.conv3": (jnp.maximum(params[f"{pre}.bn2"]["scale"] * x_hats[f"{pre}.bn2"]
+                                                + params[f"{pre}.bn2"]["bias"], 0.0), f"{pre}.bn3")}
+        if projection:
+            sources[f"{pre}.downsample.0"] = (h_in[:, ::stride, ::stride, :], f"{pre}.downsample.1")
+        for conv, (x_in, bn_name) in sources.items():
+            if conv in names:
+                dz = _bn_backward(params, x_hats, inv_stds, bn_name, deltas[bn_name])
+                out[conv] = {"w": jnp.einsum("nhwc,nhwd->cd", x_in, dz)[None, None]}
+    return out
+
+
 # ----------------------------------------------------------------------------- DFA
 
 def dfa_predict(W, e, masks):

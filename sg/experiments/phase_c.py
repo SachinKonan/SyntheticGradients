@@ -73,6 +73,17 @@ def load_predictor(url, params_np, cache):
     return unflatten(template, dict(np.load(st.fetch_file(url, cache)))), meta
 
 
+def adapted_grads(adapt, p, sig, deltas):
+    """Gradients of the adapted parameters from error signals at the BNs."""
+    if adapt == "bn":
+        return resnet.bn_grads(deltas, sig.x_hats)
+    return feedback.conv1x1_grads(p, sig.x_hats, sig.inv_stds, sig.block_io, deltas)
+
+
+def flatten_grads(g, names):
+    return jnp.concatenate([jnp.ravel(leaf) for n in names for leaf in jax.tree.leaves(g[n])])
+
+
 def calibrate(params, stats, bn0, phi, train, sm, args):
     """Per-BN-layer initial filter steps that match momentum SGD at the starting multiplier,
     from the predictor's gradients on the first training batch of every stream."""
@@ -82,14 +93,13 @@ def calibrate(params, stats, bn0, phi, train, sm, args):
         deltas = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
                                               sig.deltas, exact_top=args.exact_top,
                                               **feedback.predictor_kwargs(phi, sig.inv_stds))
-        g = resnet.bn_grads(deltas, sig.x_hats)
-        return jnp.stack([jnp.mean(jnp.square(jnp.concatenate([g[n]["scale"], g[n]["bias"]])))
-                          for n in resnet.bn_names()])
+        g = adapted_grads(args.adapt, p, sig, deltas)
+        return jnp.stack([jnp.mean(jnp.square(flatten_grads(g, [n]))) for n in sorted(bn0)])
 
     x, _ = next(st.prefetch_batches(train, 1, args.decode_workers))
     ms = sm.gather(jax.jit(jax.vmap(mean_sq), out_shardings=sm.shard)(sm.put(x))).mean(0)  # (BNs,)
     return {n: args.lr * args.init_mult * float(np.sqrt(v)) / (1 - timerule.MOMENTUM) + 1e-12
-            for n, v in zip(resnet.bn_names(), ms)}
+            for n, v in zip(sorted(bn0), ms)}
 
 
 def cosine(a, b):
@@ -110,6 +120,8 @@ def main():
     ap.add_argument("--unroll-schedule", default="", help="e.g. 1,2,4,8,16: K grows over the epochs")
     ap.add_argument("--fresh", action="store_true", help="every unroll starts from the original model")
     ap.add_argument("--time-rule", default="momentum", choices=["momentum", "filter"])
+    ap.add_argument("--adapt", default="bn", choices=["bn", "conv1x1"],
+                    help="what adapts: the BN affine params, or every 1x1 conv with BN frozen")
     ap.add_argument("--knob-lr", type=float, default=1e-2, help="Adam lr of the time-rule knobs")
     ap.add_argument("--freeze-predictor", action="store_true", help="train only the time rule (and step)")
     ap.add_argument("--switching-segment", type=int, default=0,
@@ -164,7 +176,9 @@ def main():
     val = [stream(specs[s], test_ids) for s in sm.local_ids]
     params_np, stats_np = resnet.load_torchvision(st.fetch_file(args.weights, cache))
     params, stats = sm.replicate((params_np, stats_np))
-    bn0 = tent.bn_params(params)
+    # The adapted parameters ("bn0" below): BN affine params, or every 1x1 conv with BN frozen.
+    adapted_names = resnet.bn_names() if args.adapt == "bn" else feedback.conv1x1_names()
+    bn0 = {n: params[n] for n in adapted_names}
     phi0, meta = load_predictor(args.predictor, params_np, cache)
     log(f"{S} streams, predictor {meta.get('arch')} {meta.get('config')}, exact top {args.exact_top}, "
         f"K={k_schedule}, loss on {args.loss_on}, {'fresh' if args.fresh else 'carried'} start, "
@@ -175,7 +189,8 @@ def main():
     zeros_like = lambda t: jax.tree.map(np.zeros_like, t)
     knobs0 = timerule.init_knobs("momentum")
     if args.time_rule == "filter":  # initial steps matched to momentum SGD at the starting multiplier
-        knobs0 = timerule.init_knobs("filter", eta=calibrate(params, stats, bn0, phi0, train, sm, args))
+        knobs0 = timerule.init_knobs("filter", eta=calibrate(params, stats, bn0, phi0, train, sm, args),
+                                     names=adapted_names)
     state = {"phi": phi0, "log_mult": np.float32(np.log(args.init_mult)),
              "opt_phi": {"t": np.zeros((), np.int32), "m": zeros_like(phi0), "v": zeros_like(phi0)},
              "opt_step": {"t": np.zeros((), np.int32), "m": np.float32(0), "v": np.float32(0)},
@@ -199,15 +214,15 @@ def main():
         """Predictor's BN gradient at the current state; every ResNet quantity is stop-gradient."""
         p = sg_({**params, **bn_s})
         sig = sg_(feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy))
-        g_true = resnet.bn_grads(sig.deltas, sig.x_hats)
+        g_true = adapted_grads(args.adapt, p, sig, sig.deltas)
         if feedback.is_precond(phi):  # exact gradient, learned scale
             g = feedback.apply_precond(phi, g_true)
         else:
             deltas = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
                                                   sig.deltas, exact_top=args.exact_top,
                                                   **feedback.predictor_kwargs(phi, sig.inv_stds))
-            g = resnet.bn_grads(deltas, sig.x_hats)
-        flat = lambda t: jnp.concatenate([jnp.concatenate([t[n]["scale"], t[n]["bias"]]) for n in resnet.bn_names()])
+            g = adapted_grads(args.adapt, p, sig, deltas)
+        flat = lambda t: flatten_grads(t, adapted_names)
         return g, 1 - cosine(flat(g), flat(g_true)), sig.logits
 
     def label_ce(bn_s, x, y):
@@ -343,7 +358,7 @@ def main():
         mult = float(np.exp(host["log_mult"]))
         st.write_output(args.out, "predictor.json", json.dumps(
             {**meta, "kind": "predictor", "phase_c": vars(args), "learned_mult": mult,
-             "time_rule": args.time_rule, "source_predictor": args.predictor}).encode())
+             "time_rule": args.time_rule, "adapt": args.adapt, "source_predictor": args.predictor}).encode())
         st.write_output(args.out, "results.json", json.dumps({"config": vars(args), "history": history,
                                                               "learned_mult": mult}).encode())
         log(f"done; learned step x{mult:.3f}")

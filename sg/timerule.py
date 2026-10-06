@@ -25,14 +25,15 @@ MOMENTUM = 0.9
 EPS = 1e-12
 
 
-def init_knobs(kind, eta=None, b1=0.9, b2=0.99, anchor=1e-4):
-    """eta: {bn: initial step} (e.g. from calibrate_eta); scalars per BN layer."""
+def init_knobs(kind, eta=None, b1=0.9, b2=0.99, anchor=1e-4, names=None):
+    """eta: {layer: initial step} (e.g. from calibrate_eta); scalars per adapted layer
+    (the 53 BNs by default, or e.g. the 1x1 convs)."""
     if kind == "momentum":
         return {}
     logit = lambda p: float(np.log(p / (1 - p)))
     return {n: {"log_eta": np.float32(np.log(eta[n])), "logit_b1": np.float32(logit(b1)),
                 "logit_b2": np.float32(logit(b2)), "log_anchor": np.float32(np.log(anchor))}
-            for n in resnet.bn_names()}
+            for n in (names or resnet.bn_names())}
 
 
 def calibrate_eta(grads, lr):
