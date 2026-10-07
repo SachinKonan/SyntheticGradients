@@ -33,8 +33,21 @@ def bn_names() -> list[str]:
     return names
 
 
+def save_npz(file, params, stats):
+    """(params, stats) as an .npz that load_torchvision also reads (e.g. a fine-tuned network)."""
+    np.savez(file, **{f"{kind}/{n}/{k}": np.asarray(v) for kind, tree in (("params", params), ("stats", stats))
+                      for n, d in tree.items() for k, v in d.items()})
+
+
 def load_torchvision(path: str) -> tuple[dict, dict]:
-    """Load timm/resnet50.tv_in1k safetensors into (params, stats)."""
+    """Load timm/resnet50.tv_in1k safetensors (or an .npz from save_npz) into (params, stats)."""
+    if str(path).endswith(".npz"):
+        out = {"params": {}, "stats": {}}
+        with np.load(path) as f:
+            for key in f.files:
+                kind, n, k = key.split("/")
+                out[kind].setdefault(n, {})[k] = f[key]
+        return out["params"], out["stats"]
     from safetensors.numpy import load_file
 
     w = load_file(path)

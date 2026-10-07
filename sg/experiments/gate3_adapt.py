@@ -71,33 +71,19 @@ def method_deltas(method, rec, dfa_w, p, stats, sig):
     return back() if rec is None else back(**feedback.predictor_kwargs(rec, sig.inv_stds))
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    st.add_launch_args(ap)
+def add_set_args(ap):
+    """Options for the deployment streams (shared with other deployment baselines, e.g. cotta)."""
     ap.add_argument("--set", required=True, choices=["val", "test", "continual", "r", "sketch", "v2"])
-    ap.add_argument("--adapt", default="bn", choices=["bn", "conv1x1"],
-                    help="what adapts: the 53 BN (scale, bias), or every 1x1 conv with BN frozen "
-                         "(then 'tent' is exact full-backprop fine-tuning of those convs)")
     ap.add_argument("--continual-images", type=int, default=5000, help="images per corruption (continual)")
     ap.add_argument("--batch", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=2.5e-4, help="Tent's step size; scaled by each multiplier")
-    ap.add_argument("--momentum", type=float, default=0.9)
-    ap.add_argument("--mults", default="0.3,1,3,10,30,100")
-    ap.add_argument("--predictors", default="A=gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k0best.npz,"
-                                            "B=gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k1best.npz",
-                    help="name=url,...; 'none' for no trained predictors")
-    ap.add_argument("--dfa", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/dfa_fit.npz")
-    ap.add_argument("--rank", type=int, default=64)
-    ap.add_argument("--methods", default="tent,shortcut@0,shortcut@1,shortcut@2,shortcut@4,dfa,"
-                                         "A@0,B@0,B@1,B@2,B@4")
     ap.add_argument("--steps", type=int, default=None, help="cap steps (smoke tests)")
     ap.add_argument("--streams", type=int, default=None, help="first N streams (smoke tests)")
-    args = ap.parse_args()
 
-    st.init_distributed(args)
-    lead = jax.process_index() == 0
-    log = (lambda *a: print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)) if lead else (lambda *a: None)
 
+def deployment_streams(args, cache, log):
+    """This host's streams of --set (see the module docstring). Returns (specs, sm, streams,
+    n_seg, orders, mask_logits): n_seg segments per stream (continual), orders the continual
+    corruption orders, mask_logits the ImageNet-R class restriction (identity otherwise)."""
     shift_group = {"r": "imagenet_r", "sketch": "imagenet_sketch", "v2": "imagenet_v2"}.get(args.set)
     if shift_group:
         specs = [(shift_group, i) for i in range(args.streams or 32)]
@@ -109,12 +95,7 @@ def main():
         specs = (fit_specs() if args.set == "val" else test_specs())[: args.streams]
     S = len(specs)
     sm = st.StreamMesh(S)
-    mults = np.array([float(m) for m in args.mults.split(",")], np.float32)
-    methods = args.methods.split(",")
-    traj_shard = NamedSharding(sm.shard.mesh, P(None, "streams"))  # (multipliers, streams, ...)
-    log(f"set {args.set}: {S} streams, methods {methods}, multipliers {mults.tolist()}")
 
-    cache = Path(args.local_cache)
     n_seg = 1
     if args.set == "continual":
         groups = [f"imagenet_c/{c}/5" for c in imagenet.TEST_CORRUPTIONS]
@@ -157,6 +138,39 @@ def main():
         log(f"restricting logits to {class_mask.sum()} classes")
     else:
         mask_logits = lambda l: l
+    return specs, sm, streams, n_seg, (orders if args.set == "continual" else None), mask_logits
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    st.add_launch_args(ap)
+    add_set_args(ap)
+    ap.add_argument("--adapt", default="bn", choices=["bn", "conv1x1"],
+                    help="what adapts: the 53 BN (scale, bias), or every 1x1 conv with BN frozen "
+                         "(then 'tent' is exact full-backprop fine-tuning of those convs)")
+    ap.add_argument("--lr", type=float, default=2.5e-4, help="Tent's step size; scaled by each multiplier")
+    ap.add_argument("--momentum", type=float, default=0.9)
+    ap.add_argument("--mults", default="0.3,1,3,10,30,100")
+    ap.add_argument("--predictors", default="A=gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k0best.npz,"
+                                            "B=gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k1best.npz",
+                    help="name=url,...; 'none' for no trained predictors")
+    ap.add_argument("--dfa", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/dfa_fit.npz")
+    ap.add_argument("--rank", type=int, default=64)
+    ap.add_argument("--methods", default="tent,shortcut@0,shortcut@1,shortcut@2,shortcut@4,dfa,"
+                                         "A@0,B@0,B@1,B@2,B@4")
+    args = ap.parse_args()
+
+    st.init_distributed(args)
+    lead = jax.process_index() == 0
+    log = (lambda *a: print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)) if lead else (lambda *a: None)
+
+    cache = Path(args.local_cache)
+    specs, sm, streams, n_seg, orders, mask_logits = deployment_streams(args, cache, log)
+    S = len(specs)
+    mults = np.array([float(m) for m in args.mults.split(",")], np.float32)
+    methods = args.methods.split(",")
+    traj_shard = NamedSharding(sm.shard.mesh, P(None, "streams"))  # (multipliers, streams, ...)
+    log(f"set {args.set}: {S} streams, methods {methods}, multipliers {mults.tolist()}")
     loss_fn = lambda logits: tent.entropy(mask_logits(logits))
     params, stats = sm.replicate(resnet.load_torchvision(st.fetch_file(args.weights, cache)))
     # The adapted parameters ("bn0" below): BN affine params, or the 1x1 conv weights (BN frozen;
