@@ -502,3 +502,26 @@ def test_per_stream_3x3_kernels_shard_correctly_as_einsums():
     finally:
         resnet.einsum_convs(False)
     np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_masked_batch_statistics_equal_the_subset_batch():
+    """resnet.apply(batch_mask=m) gives the selected examples exactly what a batch of only them gives."""
+    if not os.path.exists(WEIGHTS):
+        pytest.skip(f"weights not found: {WEIGHTS}")
+    params, stats = resnet.load_torchvision(WEIGHTS)
+    x = jax.random.normal(jax.random.key(0), (6, 64, 64, 3))
+    m = jnp.array([True, False, True, True, False, True])
+    full, _ = resnet.apply(params, stats, x, batch_stats=True, batch_mask=m)
+    sub, _ = resnet.apply(params, stats, x[m], batch_stats=True)
+    np.testing.assert_allclose(full[m], sub, rtol=2e-3, atol=2e-3)
+
+
+def test_hue_matches_torchvision():
+    torch = pytest.importorskip("torch")
+    tf = pytest.importorskip("torchvision.transforms.functional")
+    from sg import augment
+    x = np.random.default_rng(0).uniform(size=(2, 8, 8, 3)).astype(np.float32)
+    h, s, v = augment._rgb_to_hsv(jnp.asarray(x))
+    ours = augment._hsv_to_rgb(jnp.mod(h + 0.05, 1.0), s, v)
+    ref = tf.adjust_hue(torch.from_numpy(x).permute(0, 3, 1, 2), 0.05).permute(0, 2, 3, 1).numpy()
+    np.testing.assert_allclose(ours, ref, atol=1e-5)

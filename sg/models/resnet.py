@@ -115,9 +115,15 @@ def conv(p, x, stride=1):
         dimension_numbers=("NHWC", "HWIO", "NHWC")))
 
 
-def batchnorm(p, s, x, batch_stats):
-    """Returns (y, x_hat, inv_std). Batch statistics use the biased variance, as in PyTorch."""
-    if batch_stats:
+def batchnorm(p, s, x, batch_stats, mask=None):
+    """Returns (y, x_hat, inv_std). Batch statistics use the biased variance, as in PyTorch;
+    mask (N,) restricts them to the selected examples (as if only those were in the batch)."""
+    if batch_stats and mask is not None:
+        w = mask.astype(x.dtype)[:, None, None, None]
+        n = jnp.sum(w) * x.shape[1] * x.shape[2]
+        mean = jnp.sum(w * x, axis=(0, 1, 2)) / n
+        var = jnp.sum(w * jnp.square(x - mean), axis=(0, 1, 2)) / n
+    elif batch_stats:
         mean = jnp.mean(x, axis=(0, 1, 2))
         var = jnp.mean(jnp.square(x - mean), axis=(0, 1, 2))
     else:
@@ -162,7 +168,7 @@ def head(params, h):
     return jnp.einsum("nc,kc->nk", feats, params["fc"]["w"]) + params["fc"]["b"]
 
 
-def apply(params, stats, x, *, batch_stats, probes=None, stream_probes=None, return_blocks=False):
+def apply(params, stats, x, *, batch_stats, probes=None, stream_probes=None, return_blocks=False, batch_mask=None):
     """x: (N, 224, 224, 3) normalized images. Returns (logits, x_hats[, block_io, stem, inv_stds]).
 
     probes: optional {bn_name: zeros like that BN's output}; added to the output.
@@ -171,11 +177,12 @@ def apply(params, stats, x, *, batch_stats, probes=None, stream_probes=None, ret
     block_io: [(h_in, h_out)] for every block, i.e. the residual stream.
     stem: relu(bn1(conv1(x))), the input to the max pool.
     inv_stds: {bn_name: 1 / std} used by each BN (batch or running statistics).
+    batch_mask: optional (N,) bool; batch statistics over the selected examples only.
     """
     x_hats, inv_stds = {}, {}
 
     def bn(name, h):
-        y, x_hats[name], inv_stds[name] = batchnorm(params[name], stats[name], h, batch_stats)
+        y, x_hats[name], inv_stds[name] = batchnorm(params[name], stats[name], h, batch_stats, batch_mask)
         return y if probes is None else y + probes[name]
 
     stem = jax.nn.relu(bn("bn1", conv(params["conv1"], x, stride=2)))

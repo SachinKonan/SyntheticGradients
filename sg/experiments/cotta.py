@@ -9,13 +9,8 @@ Follows the authors' ImageNet code (qinenergy/cotta: imagenet/cotta.py, cfgs/...
     teacher's prediction is the mean of its logits over 32 augmented copies of the batch;
   - after every step each weight is reset to its source value with probability 0.001;
   - the scored prediction is the teacher's, before this batch's update.
-Augmentations follow their get_tta_transforms (soft): color jitter (brightness 0.8-1.2,
-contrast 0.85-1.15, saturation 0.75-1.25, hue +-0.03, gamma 0.85-1.15), edge padding then
-a random affine (+-8 deg, translation up to 1/16 of the padded size, scale 0.95-1.05) and
-center crop, blur (kernel 5, sigma 0.001-0.25), horizontal flip, noise (std 0.005), each
-clipped to [0, 1]; one random draw per augmented copy of the batch, as their batched
-transform does. Approximations: color ops in a fixed order (theirs is random), hue as a
-YIQ rotation, edge-replicated borders for the blur.
+Augmentations: sg.augment.tta_augment with their ImageNet settings (strong ranges, edge
+padding, blur and noise).
 
 Same streams, scoring and output as gate3_adapt (step = --lr x each of --mults).
 """
@@ -31,57 +26,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from sg.augment import tta_augment
 from sg.data import imagenet
 from sg.experiments import streams as st
 from sg.experiments.gate3_adapt import add_set_args, deployment_streams
 from sg.models import resnet
-
-GRAY = np.array([0.299, 0.587, 0.114], np.float32)  # numpy: no JAX calls before jax.distributed
-YIQ = np.array([[0.299, 0.587, 0.114], [0.596, -0.274, -0.322], [0.211, -0.523, 0.312]], np.float32)
-
-
-def augment(key, x):
-    """One CoTTA augmentation of a whole batch x (B, H, W, 3) in [0, 1]."""
-    k = jax.random.split(key, 12)
-    u = lambda i, lo, hi: jax.random.uniform(k[i], (), minval=lo, maxval=hi)
-    clip = lambda z: jnp.clip(z, 0.0, 1.0)
-    # color jitter (each op clamps, as torchvision's do)
-    x = clip(x * u(0, 0.8, 1.2))
-    m = jnp.mean(x @ GRAY, axis=(1, 2))[:, None, None, None]
-    x = clip((x - m) * u(1, 0.85, 1.15) + m)
-    g = (x @ GRAY)[..., None]
-    x = clip((x - g) * u(2, 0.75, 1.25) + g)
-    a = 2 * jnp.pi * u(3, -0.03, 0.03)
-    rot = jnp.array([[1, 0, 0], [0, jnp.cos(a), -jnp.sin(a)], [0, jnp.sin(a), jnp.cos(a)]])
-    x = clip(jnp.einsum("bhwc,dc->bhwd", x, np.linalg.inv(YIQ) @ rot @ YIQ))
-    x = clip(x ** u(4, 0.85, 1.15))
-    # affine on edge padding (pad = H/2, translation up to 1/16 of the padded size), then crop
-    n = x.shape[1]
-    ang = jnp.deg2rad(u(5, -8.0, 8.0))
-    tx, ty = jnp.round(u(6, -2 * n / 16, 2 * n / 16)), jnp.round(u(7, -2 * n / 16, 2 * n / 16))
-    sc = u(8, 0.95, 1.05)
-    c = (n - 1) / 2
-    yy, xx = jnp.meshgrid(jnp.arange(n, dtype=jnp.float32), jnp.arange(n, dtype=jnp.float32), indexing="ij")
-    qx, qy = xx - c - tx, yy - c - ty
-    sx = (jnp.cos(ang) * qx + jnp.sin(ang) * qy) / sc + c
-    sy = (-jnp.sin(ang) * qx + jnp.cos(ang) * qy) / sc + c
-    x0, y0 = jnp.floor(sx), jnp.floor(sy)
-    wx, wy = (sx - x0)[None, ..., None], (sy - y0)[None, ..., None]
-    at = lambda yi, xi: x[:, jnp.clip(yi, 0, n - 1).astype(jnp.int32), jnp.clip(xi, 0, n - 1).astype(jnp.int32), :]
-    x = ((1 - wy) * ((1 - wx) * at(y0, x0) + wx * at(y0, x0 + 1))
-         + wy * ((1 - wx) * at(y0 + 1, x0) + wx * at(y0 + 1, x0 + 1)))
-    # blur: separable 5-tap gaussian
-    sigma = u(9, 0.001, 0.25)
-    w = jnp.exp(-jnp.arange(-2, 3, dtype=jnp.float32) ** 2 / (2 * sigma ** 2))
-    w = w / w.sum()
-    pad = jnp.pad(x, ((0, 0), (2, 2), (2, 2), (0, 0)), mode="edge")
-    x = sum(w[i] * pad[:, i:i + n, 2:2 + n] for i in range(5))
-    pad = jnp.pad(x, ((0, 0), (0, 0), (2, 2), (0, 0)), mode="edge")
-    x = sum(w[i] * pad[:, :, i:i + n] for i in range(5))
-    # flip, noise
-    x = jnp.where(jax.random.uniform(k[10]) < 0.5, x[:, :, ::-1], x)
-    return clip(x + 0.005 * jax.random.normal(k[11], x.shape))
-
 
 def symmetric_ce(s, t):
     """CoTTA's loss: 0.5 CE(teacher -> student) + 0.5 CE(student -> teacher), per example."""
@@ -125,7 +74,7 @@ def main():
         key, k_aug, k_restore = jax.random.split(key, 3)
         anchor_conf = jnp.mean(jnp.max(jax.nn.softmax(fwd(source, x01)), -1))
         t_std = fwd(teacher, x01)
-        t_aug = jnp.mean(jax.lax.map(lambda kk: fwd(teacher, augment(kk, x01)),
+        t_aug = jnp.mean(jax.lax.map(lambda kk: fwd(teacher, tta_augment(kk, x01)),
                                      jax.random.split(k_aug, args.augs)), 0)
         t_out = jax.lax.stop_gradient(jnp.where(anchor_conf < args.confidence, t_aug, t_std))
         correct = jnp.sum(t_out.argmax(-1) == y)  # the teacher's prediction, before this update
