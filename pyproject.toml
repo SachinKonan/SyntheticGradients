@@ -7,7 +7,7 @@ dependencies = ["numpy", "array-record", "jax", "safetensors", "pillow"]
 
 [dependency-groups]
 prep = ["h5py"]
-dev = ["pytest", "h5py", "torch", "torchvision"]
+dev = ["pytest", "h5py", "torch", "torchvision", "timm"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
