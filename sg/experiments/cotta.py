@@ -36,8 +36,8 @@ from sg.experiments import streams as st
 from sg.experiments.gate3_adapt import add_set_args, deployment_streams
 from sg.models import resnet
 
-GRAY = jnp.array([0.299, 0.587, 0.114])
-YIQ = jnp.array([[0.299, 0.587, 0.114], [0.596, -0.274, -0.322], [0.211, -0.523, 0.312]])
+GRAY = np.array([0.299, 0.587, 0.114], np.float32)  # numpy: no JAX calls before jax.distributed
+YIQ = np.array([[0.299, 0.587, 0.114], [0.596, -0.274, -0.322], [0.211, -0.523, 0.312]], np.float32)
 
 
 def augment(key, x):
@@ -53,7 +53,7 @@ def augment(key, x):
     x = clip((x - g) * u(2, 0.75, 1.25) + g)
     a = 2 * jnp.pi * u(3, -0.03, 0.03)
     rot = jnp.array([[1, 0, 0], [0, jnp.cos(a), -jnp.sin(a)], [0, jnp.sin(a), jnp.cos(a)]])
-    x = clip(jnp.einsum("bhwc,dc->bhwd", x, jnp.linalg.inv(YIQ) @ rot @ YIQ))
+    x = clip(jnp.einsum("bhwc,dc->bhwd", x, np.linalg.inv(YIQ) @ rot @ YIQ))
     x = clip(x ** u(4, 0.85, 1.15))
     # affine on edge padding (pad = H/2, translation up to 1/16 of the padded size), then crop
     n = x.shape[1]
