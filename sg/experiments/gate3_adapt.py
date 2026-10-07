@@ -34,6 +34,7 @@ is also reported per position in the sequence.
 """
 
 import argparse
+import collections
 import functools
 import json
 import time
@@ -150,6 +151,9 @@ def main():
     ap.add_argument("--loss", default="entropy", choices=["entropy", "ce"],
                     help="test-time loss: entropy (no labels), or cross-entropy with each batch's labels "
                          "revealed after it is predicted")
+    ap.add_argument("--replay", type=int, default=1,
+                    help="with --loss ce: each update is on a sample of the last W labeled batches "
+                         "(online fine-tuning on recent data); 1 = this batch only")
     ap.add_argument("--lr", type=float, default=2.5e-4, help="Tent's step size; scaled by each multiplier")
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--mults", default="0.3,1,3,10,30,100")
@@ -161,6 +165,7 @@ def main():
     ap.add_argument("--methods", default="tent,shortcut@0,shortcut@1,shortcut@2,shortcut@4,dfa,"
                                          "A@0,B@0,B@1,B@2,B@4")
     args = ap.parse_args()
+    assert args.replay == 1 or args.loss == "ce", "--replay needs revealed labels (--loss ce)"
 
     st.init_distributed(args)
     lead = jax.process_index() == 0
@@ -225,15 +230,21 @@ def main():
         kind, knobs = rules.get(method.split("@")[0], ("momentum", {}))
 
         @functools.partial(jax.jit, donate_argnums=(0, 1), out_shardings=(traj_shard, traj_shard, traj_shard))
-        def step(bn, velocity, x, y):
+        def step(bn, velocity, x, y, xr, yr):
+            """x, y: this batch (scored before the update). xr, yr: what the update is computed on:
+            the same batch, or with --replay a sample of the recent labeled batches."""
             def per_mult(args_):
                 bn_m, vel_m, mult = args_
 
-                def per_stream(bn_s, vel_s, x_s, y_s):
+                def per_stream(bn_s, vel_s, x_s, y_s, xr_s, yr_s):
                     p = {**params, **bn_s}
-                    sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s),
-                                                 tent.test_loss(args.loss, y_s, mask_logits))
-                    correct = jnp.sum(mask_logits(sig[0]).argmax(-1) == y_s)  # scored before the update
+                    sig = feedback.exact_signals(p, stats, imagenet.normalize(xr_s),
+                                                 tent.test_loss(args.loss, yr_s, mask_logits))
+                    if args.replay > 1:  # scored before the update, on this batch
+                        logits, _ = resnet.apply(p, stats, imagenet.normalize(x_s), batch_stats=True)
+                    else:
+                        logits = sig[0]
+                    correct = jnp.sum(mask_logits(logits).argmax(-1) == y_s)
                     deltas = method_deltas(method, rec, dfa_w, p, stats, sig)
                     grads = feedback.adapted_grads(args.adapt, p, sig, deltas)
                     if rec is not None and feedback.is_precond(rec):
@@ -243,7 +254,7 @@ def main():
                     keep = lambda a, b: jax.tree.map(lambda u, v: jnp.where(ok, u, v), a, b)
                     return keep(new_bn, bn_s), keep(new_vel, vel_s), jnp.stack([correct, 1 - ok.astype(jnp.int32)])
 
-                return jax.vmap(per_stream)(bn_m, vel_m, x, y)
+                return jax.vmap(per_stream)(bn_m, vel_m, x, y, xr, yr)
 
             bn, velocity, counts = jax.lax.map(per_mult, (bn, velocity, jnp.asarray(mults)))
             return bn, velocity, counts
@@ -265,12 +276,21 @@ def main():
     steps_per_seg = max(1, num_steps // n_seg)
 
     t0 = time.time()
+    window = collections.deque(maxlen=args.replay)  # recent labeled batches of this host's streams
+    replay_rng = np.random.default_rng([11, jax.process_index()])
     for step_i, (x, y) in enumerate(st.prefetch_batches(streams, num_steps, args.decode_workers)):
         xg, yg = sm.put(x), sm.put(y)
+        xrg, yrg = xg, yg
+        if args.replay > 1:  # labels are revealed after predicting; train on a sample of the window
+            window.append((x, y))
+            pick = replay_rng.integers(0, len(window) * args.batch, size=(x.shape[0], args.batch))
+            xr = np.stack([[window[j // args.batch][0][s, j % args.batch] for j in row] for s, row in enumerate(pick)])
+            yr = np.stack([[window[j // args.batch][1][s, j % args.batch] for j in row] for s, row in enumerate(pick)])
+            xrg, yrg = sm.put(xr), sm.put(yr)
         ref_total += sm.gather(reference_correct(xg, yg))
         for m in methods:
             bn, vel = state[m]
-            bn, vel, counts = steps[m](bn, vel, xg, yg)
+            bn, vel, counts = steps[m](bn, vel, xg, yg, xrg, yrg)
             state[m] = (bn, vel)
             c = np.asarray(multihost_utils.process_allgather(counts, tiled=True))
             totals[m] += c
