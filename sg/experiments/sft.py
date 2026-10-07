@@ -2,7 +2,7 @@
 
 Our predictor is trained with labels on the 4 extra corruptions (even image ids). This
 baseline spends the same labeled images on fine-tuning the network (the BN affine params,
-or every weight) with cross-entropy, to check whether our gain just comes from having
+the 1x1 convs, or every weight) with cross-entropy, to check whether our gain just comes from having
 seen labeled corrupted data. The fine-tuned network is then deployed like the original
 (no adaptation, BN-adapt, Tent): gate3_adapt --weights <out>/weights.npz.
 
@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from sg import feedback
 from sg.data import imagenet
 from sg.experiments import streams as st
 from sg.experiments.gate2_predictability import fit_ids, fit_specs, test_ids
@@ -46,7 +47,7 @@ class PlanStream:
 def main():
     ap = argparse.ArgumentParser()
     st.add_launch_args(ap)
-    ap.add_argument("--params", default="all", choices=["bn", "all"], help="what is fine-tuned")
+    ap.add_argument("--params", default="all", choices=["bn", "conv1x1", "all"], help="what is fine-tuned")
     ap.add_argument("--lr", type=float, required=True, help="peak SGD lr (cosine decay to 0)")
     ap.add_argument("--epochs", type=int, default=4)
     ap.add_argument("--batch", type=int, default=64)
@@ -86,7 +87,7 @@ def main():
         return [PlanStream(loaded, plan[s * n:(s + 1) * n]) for s in sm.local_ids], n
 
     params, stats = sm.replicate(resnet.load_torchvision(st.fetch_file(args.weights, cache)))
-    names = resnet.bn_names() if args.params == "bn" else sorted(params)
+    names = {"bn": resnet.bn_names(), "conv1x1": feedback.conv1x1_names(), "all": sorted(params)}[args.params]
     theta = {n: params[n] for n in names}
     vel = jax.tree.map(jnp.zeros_like, theta)
     steps_per_epoch = epoch_streams(0)[1]
