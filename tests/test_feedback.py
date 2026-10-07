@@ -295,8 +295,30 @@ def test_filter_rule_matches_its_formula():
     g = {n: {"scale": jnp.array([1.0, -2.0, 0.5]), "bias": jnp.array([0.1, 0.1, 0.1])} for n in names}
     state = timerule.init_state("filter", bn)
     new, state = timerule.apply("filter", knobs, state, bn, g, bn, lr=0.0, mult=1.0)
-    # First step: bias-corrected avg = g, sq = g^2, so the step is eta * sign(g); source = start.
-    np.testing.assert_allclose(new[names[0]]["scale"], 1 - 0.1 * np.sign([1.0, -2.0, 0.5]), rtol=1e-5)
+    # First step: bias-corrected avg = g, sq = g^2, so the step is eta * g / (|g| + 1% rms(g)),
+    # nearly eta * sign(g); source = start.
+    gs = np.array([1.0, -2.0, 0.5])
+    step = gs / (np.abs(gs) + timerule.REL_EPS * np.sqrt(np.mean(gs ** 2)))
+    np.testing.assert_allclose(new[names[0]]["scale"], 1 - 0.1 * step, rtol=1e-5)
+
+
+def test_filter_step_has_a_bounded_slope_near_zero_gradients():
+    """phase_c differentiates through the filter; a near-zero gradient entry must not dominate."""
+    from sg import timerule
+    names = resnet.bn_names()[:1]
+    bn = {n: {"scale": jnp.ones(3), "bias": jnp.zeros(3)} for n in names}
+    knobs = {n: v for n, v in timerule.init_knobs("filter", eta={n: 1.0 for n in resnet.bn_names()}).items()
+             if n in names}
+
+    def update(gs):
+        g = {n: {"scale": gs, "bias": jnp.ones(3)} for n in names}
+        w, _ = timerule.apply("filter", knobs, timerule.init_state("filter", bn), bn, g, bn, lr=0.0, mult=1.0)
+        return w[names[0]]["scale"]
+
+    gs = jnp.array([1e-9, 1.0, -1.0])
+    slope = jnp.abs(jnp.diag(jax.jacobian(update)(gs)))
+    rms = float(jnp.sqrt(jnp.mean(gs ** 2)))
+    assert float(slope.max()) <= 1.01 / (timerule.REL_EPS * rms)
 
 
 def test_filter_knob_gradients_are_finite_with_zero_gradients():

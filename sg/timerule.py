@@ -5,10 +5,10 @@
             (a diagonal Kalman / natural-gradient update; Ollivier 2018):
               avg  <- b1 avg + (1 - b1) g          running gradient
               sq   <- b2 sq  + (1 - b2) g^2        running size of the gradient
-              w    <- w - eta * avg / sqrt(sq)     big steps when gradients agree,
+              w    <- w - eta * avg / (sqrt(sq) + e)  big steps when gradients agree,
                                                    small when they flip (noise)
               w    <- w - anchor * (w - w_source)  pull back toward the source model
-            with bias-corrected averages. Per BN layer it has four learned knobs:
+            with bias-corrected averages and e = 1% of the layer's typical sqrt(sq). Per BN layer it has four learned knobs:
             eta (step), b1 and b2 (memory lengths), anchor (pull-back strength).
 
 Everything is a pure function of (knobs, state, w, g, w_source), so the knobs can
@@ -23,6 +23,9 @@ from sg.models import resnet
 
 MOMENTUM = 0.9
 EPS = 1e-12
+# The step avg / sqrt(sq) is sign(g) on the first batch, whose slope is unbounded where g ~ 0;
+# phase_c differentiates through it, so the floor is relative to the layer's gradient size.
+REL_EPS = 1e-2
 
 
 def init_knobs(kind, eta=None, b1=0.9, b2=0.99, anchor=1e-4, names=None):
@@ -65,7 +68,10 @@ def apply(kind, knobs, state, bn, g, bn_source, lr, mult):
         avg[n] = jax.tree.map(lambda a, gg: b1 * a + (1 - b1) * gg, state["avg"][n], g[n])
         sq[n] = jax.tree.map(lambda s, gg: b2 * s + (1 - b2) * gg * gg, state["sq"][n], g[n])
         # sqrt has an infinite derivative at 0 (exactly-zero gradients), so keep it off zero.
-        step = jax.tree.map(lambda a, s: (a / (1 - b1 ** t)) / (jnp.sqrt(s / (1 - b2 ** t) + EPS ** 2) + EPS),
-                            avg[n], sq[n])
+        def step_of(a, s):
+            root = jnp.sqrt(s / (1 - b2 ** t) + EPS ** 2)
+            floor = REL_EPS * jax.lax.stop_gradient(jnp.sqrt(jnp.mean(jnp.square(root)))) + EPS
+            return (a / (1 - b1 ** t)) / (root + floor)
+        step = jax.tree.map(step_of, avg[n], sq[n])
         new_bn[n] = jax.tree.map(lambda w, d, w0: w - eta * d - anchor * (w - w0), bn[n], step, bn_source[n])
     return new_bn, {"avg": avg, "sq": sq, "t": t}

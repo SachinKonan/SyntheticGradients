@@ -260,16 +260,24 @@ def main():
             if args.freeze_predictor:
                 phi = sg_(phi)
             mult = jnp.exp(trainable["log_mult"]) if args.time_rule == "momentum" else 1.0  # filter: eta is a knob
-            imit, correct, ce_sum = 0.0, 0, 0.0
-            for t in range(K):
-                bn_s, vel_s, mis, logits = update_fn(phi, knobs, mult, bn_s, vel_s, xs[t])
-                correct += jnp.sum(logits.argmax(-1) == ys[t])
-                imit += mis / K
-                if args.loss_on == "all" or t == K - 1:
-                    ce_t, logits_next = ce_fn(bn_s, xs[t + 1], ys[t + 1])
-                    ce_sum += ce_t
-            correct += jnp.sum(logits_next.argmax(-1) == ys[K])
-            ce = ce_sum / K if args.loss_on == "all" else ce_sum
+
+            def step(carry, batch):  # one update, then (--loss-on all) the label loss of the next batch
+                bn_s, vel_s = carry
+                x, y, x_next, y_next = batch
+                bn_s, vel_s, mis, logits = update_fn(phi, knobs, mult, bn_s, vel_s, x)
+                ce_t = ce_fn(bn_s, x_next, y_next)[0] if args.loss_on == "all" else 0.0
+                return (bn_s, vel_s), (mis, jnp.sum(logits.argmax(-1) == y), ce_t)
+
+            # The first K-1 updates as a scan (one compiled step, whatever K), then the last one, whose
+            # next-batch loss counts under either --loss-on.
+            (bn_s, vel_s), (mis, correct, ce_t) = jax.lax.scan(
+                step, (bn_s, vel_s), (xs[:K - 1], ys[:K - 1], xs[1:K], ys[1:K]))
+            bn_s, vel_s, mis_last, logits = update_fn(phi, knobs, mult, bn_s, vel_s, xs[K - 1])
+            ce_last, logits_next = ce_fn(bn_s, xs[K], ys[K])
+            imit = (jnp.sum(mis) + mis_last) / K
+            correct = (jnp.sum(correct) + jnp.sum(logits.argmax(-1) == ys[K - 1])
+                       + jnp.sum(logits_next.argmax(-1) == ys[K]))
+            ce = (jnp.sum(ce_t) + ce_last) / K if args.loss_on == "all" else ce_last
             return ce + args.imitation * imit, (sg_(bn_s), sg_(vel_s), ce, imit, correct)
 
         @functools.partial(jax.jit, donate_argnums=(0, 1, 2), out_shardings=(sm.shard, sm.shard, sm.repl, sm.repl))
