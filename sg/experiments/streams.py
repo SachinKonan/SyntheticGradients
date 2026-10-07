@@ -66,8 +66,44 @@ class Stream:
         self.batch = batch
         self.num_steps = n // batch
 
+    images = labels = None  # decoded copies of the records, if decode_in_ram ran
+
+    def view(self, perm):
+        """The same records (and decoded images, if any) in another order."""
+        v = Stream.__new__(Stream)
+        v.records, v.images, v.labels, v.batch, v.resize = self.records, self.images, self.labels, self.batch, self.resize
+        v.perm, v.num_steps = perm, len(self.records) // self.batch
+        return v
+
     def batch_records(self, step):
         return [self.records[i] for i in self.perm[step * self.batch:(step + 1) * self.batch]]
+
+    def batch_arrays(self, step):
+        idx = self.perm[step * self.batch:(step + 1) * self.batch]
+        return self.images[idx], self.labels[idx]
+
+    @property
+    def decoded(self):
+        return self.images is not None
+
+
+def decode_in_ram(streams, workers):
+    """Decode every image of these streams once into RAM (uint8, 150 KB each), so a batch is a copy
+    instead of JPEG decoding. Views made afterwards (Stream.view) share the arrays."""
+    pool = cf.ThreadPoolExecutor(workers)
+    for s in streams:
+        if s.decoded:
+            continue
+        images = np.empty((len(s.records), 224, 224, 3), np.uint8)
+        labels = np.empty(len(s.records), np.int32)
+
+        def one(i, s=s, images=images, labels=labels):
+            label, _, jpeg = decode(s.records[i])
+            images[i], labels[i] = imagenet.load_uint8(jpeg, s.resize), label
+
+        list(pool.map(one, range(len(s.records))))
+        s.images, s.labels = images, labels
+    pool.shutdown()
 
 
 def prefetch_batches(streams, num_steps, workers, depth=3):
@@ -83,10 +119,14 @@ def prefetch_batches(streams, num_steps, workers, depth=3):
     def run():
         try:
             for step in range(num_steps):
-                items = [(r, s.resize) for s in streams for r in s.batch_records(step)]
-                out = list(pool.map(decode_one, items))
-                x = np.stack([o[0] for o in out]).reshape(len(streams), -1, 224, 224, 3)
-                y = np.array([o[1] for o in out], np.int32).reshape(len(streams), -1)
+                if all(getattr(s, "decoded", False) for s in streams):  # decoded in RAM: a copy
+                    parts = [s.batch_arrays(step) for s in streams]
+                    x, y = np.stack([a for a, _ in parts]), np.stack([b for _, b in parts])
+                else:
+                    items = [(r, s.resize) for s in streams for r in s.batch_records(step)]
+                    out = list(pool.map(decode_one, items))
+                    x = np.stack([o[0] for o in out]).reshape(len(streams), -1, 224, 224, 3)
+                    y = np.array([o[1] for o in out], np.int32).reshape(len(streams), -1)
                 q.put((x, y))
             q.put(None)
         except BaseException as exc:  # surface loader errors instead of hanging the consumer
@@ -153,6 +193,8 @@ def add_launch_args(p):
     p.add_argument("--out", required=True, help="results dir (local or gs://)")
     p.add_argument("--precision", default="highest", choices=["default", "high", "highest"])
     p.add_argument("--decode-workers", type=int, default=min(64, os.cpu_count()))
+    p.add_argument("--ram-cache", action="store_true",
+                   help="decode every image once into RAM (~150 KB per image) instead of per batch")
     p.add_argument("--coordinator", default=None)
     p.add_argument("--num-processes", type=int, default=1)
     p.add_argument("--process-id", type=int, default=0)
@@ -197,6 +239,18 @@ class ConcatStream:
         self.num_steps = steps_each * len(segments)
         self.resize = segments[0].resize
 
-    def batch_records(self, step):
+    def _at(self, step):
         """Segments repeat in order if more steps are asked for than they hold."""
-        return self.segments[(step // self.steps_each) % len(self.segments)].batch_records(step % self.steps_each)
+        return self.segments[(step // self.steps_each) % len(self.segments)], step % self.steps_each
+
+    def batch_records(self, step):
+        seg, i = self._at(step)
+        return seg.batch_records(i)
+
+    def batch_arrays(self, step):
+        seg, i = self._at(step)
+        return seg.batch_arrays(i)
+
+    @property
+    def decoded(self):
+        return all(s.decoded for s in self.segments)

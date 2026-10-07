@@ -122,12 +122,11 @@ def main():
         # One copy of each corruption's records per host; every stream draws its own order.
         loaded = {g: st.Stream(st.fetch(args.data_root, g, cache), 0, args.batch, test_ids) for g in groups}
 
+        if args.ram_cache:
+            st.decode_in_ram(loaded.values(), args.decode_workers)
+
         def view(g, seed):
-            v = st.Stream.__new__(st.Stream)
-            v.records, v.batch, v.resize = loaded[g].records, args.batch, False
-            v.perm = np.random.default_rng(seed).permutation(len(v.records))
-            v.num_steps = len(v.records) // args.batch
-            return v
+            return loaded[g].view(np.random.default_rng(seed).permutation(len(loaded[g].records)))
 
         streams = [st.ConcatStream([view(groups[c], [s, j]) for j, c in enumerate(orders[s])], steps_each)
                    for s in sm.local_ids]
@@ -135,16 +134,19 @@ def main():
     elif shift_group:
         shared = st.Stream(st.fetch(args.data_root, shift_group, cache), 0, args.batch, None, resize=True)
 
+        if args.ram_cache:
+            st.decode_in_ram([shared], args.decode_workers)
+
         def view(order):
-            v = st.Stream.__new__(st.Stream)
-            v.records, v.batch, v.resize, v.num_steps = shared.records, args.batch, True, shared.num_steps
-            v.perm = np.arange(len(v.records)) if order == 0 else np.random.default_rng(order).permutation(len(v.records))
-            return v
+            n = len(shared.records)
+            return shared.view(np.arange(n) if order == 0 else np.random.default_rng(order).permutation(n))
 
         streams = [view(specs[s][1]) for s in sm.local_ids]
     else:
         streams = [st.Stream(st.fetch(args.data_root, specs[s][0], cache), specs[s][1], args.batch, test_ids,
                              resize=imagenet.needs_resize(specs[s][0])) for s in sm.local_ids]
+        if args.ram_cache:
+            st.decode_in_ram(streams, args.decode_workers)
 
     # ImageNet-R: restrict logits to its 200 classes (predictions and the entropy loss).
     subset_file = (st.fetch(args.data_root, shift_group, cache) / "class_subset.json") if shift_group else None

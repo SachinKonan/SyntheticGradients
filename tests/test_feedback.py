@@ -422,3 +422,25 @@ def test_split_batch_matches_one_device():
             assert out[0].sharding.spec[0] == "streams"
             for a, b in zip(jax.tree.leaves(out), jax.tree.leaves(ref)):
                 np.testing.assert_allclose(a, b, rtol=1e-9, atol=1e-12 * float(jnp.abs(b).max()))
+
+
+def test_ram_cache_gives_the_same_batches():
+    """Streams decoded into RAM (and their views, back to back) yield exactly the JPEG-path batches."""
+    from pathlib import Path
+    from sg.experiments import streams as st
+    group = Path("/scratch/gpfs/ZHUANGL/sk7524/data/imagenet-c/packed/imagenet_c/spatter/3")
+    if not group.exists():
+        pytest.skip(f"data not found: {group}")
+    base = st.Stream(group, 0, 8)
+    base.records = base.records[:64]
+    rng = np.random.default_rng(0)
+    make = lambda: [st.ConcatStream([base.view(rng.permutation(64)), base.view(rng.permutation(64))], 3),
+                    base.view(rng.permutation(64))]
+    jpeg_streams = make()
+    rng = np.random.default_rng(0)
+    st.decode_in_ram([base], 4)
+    ram_streams = make()
+    assert all(s.decoded for s in ram_streams) and not any(s.decoded for s in jpeg_streams)
+    for (xa, ya), (xb, yb) in zip(st.prefetch_batches(jpeg_streams, 6, 4), st.prefetch_batches(ram_streams, 6, 4)):
+        np.testing.assert_array_equal(xa, xb)
+        np.testing.assert_array_equal(ya, yb)

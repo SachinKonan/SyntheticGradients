@@ -39,6 +39,7 @@ import argparse
 import functools
 import io
 import json
+import os
 import time
 from pathlib import Path
 
@@ -177,14 +178,16 @@ def main():
                 rng = np.random.default_rng([epoch, spec_id, 17] + ([args.seed] if args.seed else []))
                 segs = []
                 for j, gi in enumerate(rng.permutation(len(groups))):
-                    v = st.Stream.__new__(st.Stream)
-                    v.records, v.batch, v.resize = loaded[groups[gi]].records, args.batch, False
-                    v.perm = np.random.default_rng([epoch, spec_id, j]).permutation(len(v.records))
-                    v.num_steps = len(v.records) // args.batch
-                    segs.append(v)
+                    base = loaded[groups[gi]]
+                    segs.append(base.view(np.random.default_rng([epoch, spec_id, j]).permutation(len(base.records))))
                 out.append(st.ConcatStream(segs, args.switching_segment))
             return out
     val = [stream(specs[s], test_ids) for s in sm.local_ids]
+    if args.ram_cache:
+        t = time.time()
+        st.decode_in_ram((list(loaded.values()) if args.switching_segment else train) + val,
+                         max(args.decode_workers, 2 * (os.cpu_count() or 1) // 3))
+        log(f"decoded into RAM in {time.time() - t:.0f}s")
     params_np, stats_np = resnet.load_torchvision(st.fetch_file(args.weights, cache))
     params, stats = sm.replicate((params_np, stats_np))
     # The adapted parameters ("bn0" below): BN affine params, or every 1x1 conv with BN frozen.
