@@ -135,6 +135,9 @@ def main():
     ap.add_argument("--inner-loss", default="entropy", choices=["entropy", "ce"],
                     help="the loss whose gradient the predictor stands in for at each update: entropy (Tent, "
                          "no labels) or cross-entropy with the batch's labels (revealed after predicting)")
+    ap.add_argument("--learner", default="gpn", choices=["gpn", "init"],
+                    help="gpn: learn the predictor (the update rule); init: MAML baseline, learn the starting "
+                         "values of the adapted weights, updated by exact backprop at every step")
     ap.add_argument("--second-order", action="store_true",
                     help="exact meta-gradient (MAML): do not stop-gradient what the predictor reads from ResNet")
     ap.add_argument("--freeze-eta", action="store_true",
@@ -198,7 +201,12 @@ def main():
     if args.adapt == "conv":  # every stream carries its own 3x3 kernels
         resnet.einsum_convs(True)
     bn0 = {n: params[n] for n in adapted_names}
-    phi0, meta = load_predictor(args.predictor, params_np, cache)
+    if args.learner == "init":  # MAML: the learned thing is the starting point of the adapted weights
+        phi0 = {n: np.asarray(params_np[n]) if not isinstance(params_np[n], dict) else
+                jax.tree.map(np.asarray, params_np[n]) for n in adapted_names}
+        meta = {"arch": "init", "config": "MAML: learned starting weights, exact-backprop updates"}
+    else:
+        phi0, meta = load_predictor(args.predictor, params_np, cache)
     log(f"{S} streams, predictor {meta.get('arch')} {meta.get('config')}, exact top {args.exact_top}, "
         f"K={k_schedule}, loss on {args.loss_on}, {'fresh' if args.fresh else 'carried'} start, "
         f"meta-lr {args.meta_lr}, imitation {args.imitation}, start step x{args.init_mult}, "
@@ -241,6 +249,8 @@ def main():
             p = sg_({**params, **bn_s})
             sig = sg_(feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.test_loss(args.inner_loss, y_s)))
         g_true = feedback.adapted_grads(args.adapt, p, sig, sig.deltas)
+        if args.learner == "init":  # exact backprop (MAML inner loop)
+            return g_true, jnp.float32(0.0), sig.logits
         if feedback.is_precond(phi):  # exact gradient, learned scale
             g = feedback.apply_precond(phi, g_true)
         else:
@@ -275,6 +285,8 @@ def main():
             if args.freeze_predictor:
                 phi = sg_(phi)
             mult = jnp.exp(trainable["log_mult"]) if args.time_rule == "momentum" else 1.0  # filter: eta is a knob
+            if args.learner == "init":  # carried state is the offset from the learned start
+                bn_s = jax.tree.map(jnp.add, phi, bn_s)
 
             def step(carry, batch):  # one update, then (--loss-on all) the label loss of the next batch
                 bn_s, vel_s = carry
@@ -300,6 +312,8 @@ def main():
             imit = jnp.mean(mis)
             correct = jnp.sum(correct) + jnp.sum(logits_next.argmax(-1) == ys[K])
             ce = jnp.mean(ce_t) if args.loss_on == "all" else ce_last
+            if args.learner == "init":
+                bn_s = jax.tree.map(jnp.subtract, bn_s, phi)
             return ce + args.imitation * imit, (sg_(bn_s), sg_(vel_s), ce, imit, correct)
 
         @functools.partial(jax.jit, donate_argnums=(0, 1, 2), out_shardings=(sm.shard, sm.shard, sm.repl, sm.repl))
@@ -334,7 +348,7 @@ def main():
         return jax.vmap(one, spmd_axis_name="streams")(bn, vel, x, y)
 
     def evaluate(tag):
-        bn, vel = fresh(bn0)
+        bn, vel = fresh(state["phi"] if args.learner == "init" else bn0)
         correct = np.zeros(S)
         for x, y in st.prefetch_batches(val, args.eval_steps, args.decode_workers):
             bn, vel, c = deploy_step(bn, vel, sm.put(x, 1), sm.put(y, 1), state["phi"], state["log_mult"], state["knobs"])
@@ -353,6 +367,8 @@ def main():
             st.write_output(args.out, "ckpt/meta.json", json.dumps(
                 {"epochs_done": epochs_done, "updates_done": updates_done, "history": history}).encode())
 
+    # Training carries the adapted weights (gpn) or their offset from the learned start (init).
+    start0 = jax.tree.map(jnp.zeros_like, bn0) if args.learner == "init" else bn0
     steps_per_epoch = st.common_steps(train)
     if args.steps:
         steps_per_epoch = min(steps_per_epoch, args.steps)
@@ -360,6 +376,7 @@ def main():
         evaluate("start")
     t0, n, data_wait = time.time(), 0, 0.0  # data_wait: seconds blocked on image loading
     assert not (args.updates and args.unroll_schedule), "--updates needs a fixed K"
+    assert args.learner == "gpn" or args.time_rule == "momentum", "--learner init uses momentum SGD"
     for epoch in range(start_epoch, 10 ** 6 if args.updates else args.epochs):
         if args.updates and updates_done >= args.updates:
             break
@@ -373,7 +390,7 @@ def main():
         outer_per_epoch = (steps_per_epoch - 1) // K
         if args.updates:
             outer_per_epoch = min(outer_per_epoch, args.updates - updates_done)
-        bn, vel = fresh(bn0)
+        bn, vel = fresh(start0)
         batches = st.prefetch_batches(epoch_streams, outer_per_epoch * K + 1, args.decode_workers)
         x_prev, y_prev = next(batches)
         for i in range(outer_per_epoch):
@@ -383,7 +400,7 @@ def main():
             xs = np.stack([w[0] for w in window], axis=1)  # (local streams, K+1, B, ...)
             ys = np.stack([w[1] for w in window], axis=1)
             if args.fresh:
-                bn, vel = fresh(bn0)
+                bn, vel = fresh(start0)
             bn, vel, state, info = outer_steps[K](bn, vel, state, sm.put(xs, 2), sm.put(ys, 2))
             x_prev, y_prev = window[-1]  # the scored batch is the next unroll's first batch
             n += 1
@@ -406,6 +423,10 @@ def main():
             buf = io.BytesIO()
             np.savez(buf, **flatten(host["knobs"]))
             st.write_output(args.out, "time_rule.npz", buf.getvalue())
+        if args.learner == "init":  # the learned starting weights, for gate3_adapt --weights
+            buf = io.BytesIO()
+            resnet.save_npz(buf, {**params_np, **host["phi"]}, stats_np)
+            st.write_output(args.out, "weights.npz", buf.getvalue())
         mult = float(np.exp(host["log_mult"]))
         st.write_output(args.out, "predictor.json", json.dumps(
             {**meta, "kind": "predictor", "phase_c": vars(args), "learned_mult": mult,
