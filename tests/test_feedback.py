@@ -525,3 +525,39 @@ def test_hue_matches_torchvision():
     ours = augment._hsv_to_rgb(jnp.mod(h + 0.05, 1.0), s, v)
     ref = tf.adjust_hue(torch.from_numpy(x).permute(0, 3, 1, 2), 0.05).permute(0, 2, 3, 1).numpy()
     np.testing.assert_allclose(ours, ref, atol=1e-5)
+
+
+def test_second_order_meta_gradient_matches_finite_differences(signals):
+    """Phase C --second-order: the exact meta-gradient through two predictor-driven Tent steps
+    (nothing stop-gradient) matches a finite difference; the first-order one differs."""
+    params, stats, *_ = signals
+    with jax.enable_x64(True):
+        phi = f64(feedback.init_lowrank(params, 0.25))
+        xs = jax.random.normal(jax.random.key(1), (3, 4, 32, 32, 3), jnp.float64)
+        ys = jnp.array([[1, 2, 3, 4]] * 3)
+        bn0 = {n: params[n] for n in resnet.bn_names()}
+
+        def meta_loss(phi, second_order):
+            sg = (lambda t: t) if second_order else jax.lax.stop_gradient
+            bn = bn0
+            for t in range(2):
+                p = {**params, **bn}
+                sig = feedback.exact_signals(p if second_order else sg(p), stats, xs[t], tent.entropy)
+                sig = sig if second_order else sg(sig)
+                deltas = feedback.backward_over_depth(p if second_order else sg(p), stats, sig.x_hats, sig.block_io,
+                                                      sig.stem, sig.d_stream, sig.deltas, exact_top=1,
+                                                      **feedback.predictor_kwargs(phi, sig.inv_stds))
+                g = resnet.bn_grads(deltas, sig.x_hats)
+                bn = jax.tree.map(lambda w, gg: w - 0.01 * gg, bn, g)
+            logits, _ = resnet.apply({**params, **bn}, stats, xs[2], batch_stats=True)
+            return jnp.mean(jax.nn.logsumexp(logits, -1) - jnp.take_along_axis(logits, ys[2][:, None], -1)[:, 0])
+
+        v = jax.tree.map(lambda a: jax.random.normal(jax.random.key(a.size % 997), a.shape, a.dtype), phi)
+        eps = 1e-10  # ReLU masks in the backward flip under larger nudges (the loss jumps there)
+        fd = (meta_loss(jax.tree.map(lambda a, b: a + eps * b, phi, v), True)
+              - meta_loss(jax.tree.map(lambda a, b: a - eps * b, phi, v), True)) / (2 * eps)
+        dot = lambda g: sum(jnp.sum(a * b) for a, b in zip(jax.tree.leaves(g), jax.tree.leaves(v)))
+        second = dot(jax.grad(meta_loss)(phi, True))
+        first = dot(jax.grad(meta_loss)(phi, False))
+        np.testing.assert_allclose(second, fd, rtol=1e-4)
+        assert abs(first - second) > 1e-3 * abs(second)

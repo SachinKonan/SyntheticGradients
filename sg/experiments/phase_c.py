@@ -131,6 +131,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--updates", type=int, default=None,
                     help="stop after this many predictor updates (overrides --epochs; may end mid-epoch)")
+    ap.add_argument("--second-order", action="store_true",
+                    help="exact meta-gradient (MAML): do not stop-gradient what the predictor reads from ResNet")
     ap.add_argument("--freeze-eta", action="store_true",
                     help="filter: keep each layer's step at its calibrated start; learn only b1, b2, anchor")
     ap.add_argument("--seed", type=int, default=0, help="training stream order (0 reproduces earlier runs)")
@@ -224,9 +226,16 @@ def main():
         return bn, jax.vmap(lambda b: timerule.init_state(args.time_rule, b))(bn)
 
     def predicted_grads(phi, bn_s, x_s):
-        """Predictor's BN gradient at the current state; every ResNet quantity is stop-gradient."""
-        p = sg_({**params, **bn_s})
-        sig = sg_(feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy))
+        """Predictor's gradient at the current state. First order (default): every ResNet quantity
+        it reads is stop-gradient. --second-order: they stay differentiable in the adapted weights,
+        so the outer gradient also counts how earlier updates change what the predictor reads
+        (Hessian-vector products of the network; ResNet's own weights are still never trained)."""
+        if args.second_order:
+            p = {**sg_(params), **bn_s}
+            sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy)
+        else:
+            p = sg_({**params, **bn_s})
+            sig = sg_(feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy))
         g_true = feedback.adapted_grads(args.adapt, p, sig, sig.deltas)
         if feedback.is_precond(phi):  # exact gradient, learned scale
             g = feedback.apply_precond(phi, g_true)
