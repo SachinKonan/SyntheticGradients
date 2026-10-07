@@ -35,7 +35,6 @@ is also reported per position in the sequence.
 
 import argparse
 import functools
-import io
 import json
 import time
 from pathlib import Path
@@ -148,6 +147,9 @@ def main():
     ap.add_argument("--adapt", default="bn", choices=["bn", "conv1x1", "conv"],
                     help="what adapts: the 53 BN (scale, bias), or (BN frozen) every 1x1 conv, or every "
                          "conv after the stem (then 'tent' is exact full-backprop fine-tuning of those convs)")
+    ap.add_argument("--loss", default="entropy", choices=["entropy", "ce"],
+                    help="test-time loss: entropy (no labels), or cross-entropy with each batch's labels "
+                         "revealed after it is predicted")
     ap.add_argument("--lr", type=float, default=2.5e-4, help="Tent's step size; scaled by each multiplier")
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--mults", default="0.3,1,3,10,30,100")
@@ -171,7 +173,6 @@ def main():
     methods = args.methods.split(",")
     traj_shard = NamedSharding(sm.shard.mesh, P(None, "streams"))  # (multipliers, streams, ...)
     log(f"set {args.set}: {S} streams, methods {methods}, multipliers {mults.tolist()}")
-    loss_fn = lambda logits: tent.entropy(mask_logits(logits))
     params, stats = sm.replicate(resnet.load_torchvision(st.fetch_file(args.weights, cache)))
     # The adapted parameters ("bn0" below): BN affine params, or the 1x1 conv weights (BN frozen;
     # BN still uses test-batch statistics, as for every method).
@@ -230,7 +231,8 @@ def main():
 
                 def per_stream(bn_s, vel_s, x_s, y_s):
                     p = {**params, **bn_s}
-                    sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), loss_fn)
+                    sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s),
+                                                 tent.test_loss(args.loss, y_s, mask_logits))
                     correct = jnp.sum(mask_logits(sig[0]).argmax(-1) == y_s)  # scored before the update
                     deltas = method_deltas(method, rec, dfa_w, p, stats, sig)
                     grads = feedback.adapted_grads(args.adapt, p, sig, deltas)

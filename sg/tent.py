@@ -18,6 +18,19 @@ def entropy(logits):
     return -jnp.mean(jnp.sum(jnp.exp(logp) * logp, axis=-1))
 
 
+def cross_entropy(logits, y):
+    """Mean label cross-entropy over the batch."""
+    return jnp.mean(jax.nn.logsumexp(logits, -1) - jnp.take_along_axis(logits, y[:, None], -1)[:, 0])
+
+
+def test_loss(kind, y=None, mask_logits=lambda l: l):
+    """The loss adaptation minimizes on a test batch: 'entropy' (Tent, no labels) or 'ce' (the
+    batch's labels, revealed after it is predicted)."""
+    if kind == "entropy":
+        return lambda logits: entropy(mask_logits(logits))
+    return lambda logits: cross_entropy(mask_logits(logits), y)
+
+
 def bn_params(params):
     return {name: params[name] for name in resnet.bn_names()}
 

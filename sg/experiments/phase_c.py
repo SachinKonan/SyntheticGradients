@@ -82,17 +82,18 @@ def flatten_grads(g, names):
 def calibrate(params, stats, bn0, phi, train, sm, args):
     """Per-BN-layer initial filter steps that match momentum SGD at the starting multiplier,
     from the predictor's gradients on the first training batch of every stream."""
-    def mean_sq(x_s):
+    def mean_sq(x_s, y_s):
         p = {**params, **bn0}
-        sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy)
+        sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.test_loss(args.inner_loss, y_s))
         deltas = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
                                               sig.deltas, exact_top=args.exact_top,
                                               **feedback.predictor_kwargs(phi, sig.inv_stds))
         g = feedback.adapted_grads(args.adapt, p, sig, deltas)
         return jnp.stack([jnp.mean(jnp.square(flatten_grads(g, [n]))) for n in sorted(bn0)])
 
-    x, _ = next(st.prefetch_batches(train, 1, args.decode_workers))
-    ms = sm.gather(jax.jit(jax.vmap(mean_sq, spmd_axis_name="streams"), out_shardings=sm.shard)(sm.put(x, 1))).mean(0)  # (BNs,)
+    x, y = next(st.prefetch_batches(train, 1, args.decode_workers))
+    ms = sm.gather(jax.jit(jax.vmap(mean_sq, spmd_axis_name="streams"), out_shardings=sm.shard)(
+        sm.put(x, 1), sm.put(y, 1))).mean(0)  # (BNs,)
     return {n: args.lr * args.init_mult * float(np.sqrt(v)) / (1 - timerule.MOMENTUM) + 1e-12
             for n, v in zip(sorted(bn0), ms)}
 
@@ -131,6 +132,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=8)
     ap.add_argument("--updates", type=int, default=None,
                     help="stop after this many predictor updates (overrides --epochs; may end mid-epoch)")
+    ap.add_argument("--inner-loss", default="entropy", choices=["entropy", "ce"],
+                    help="the loss whose gradient the predictor stands in for at each update: entropy (Tent, "
+                         "no labels) or cross-entropy with the batch's labels (revealed after predicting)")
     ap.add_argument("--second-order", action="store_true",
                     help="exact meta-gradient (MAML): do not stop-gradient what the predictor reads from ResNet")
     ap.add_argument("--freeze-eta", action="store_true",
@@ -225,17 +229,17 @@ def main():
         bn = jax.tree.map(lambda a: jnp.broadcast_to(a, (S,) + a.shape), bn0)
         return bn, jax.vmap(lambda b: timerule.init_state(args.time_rule, b))(bn)
 
-    def predicted_grads(phi, bn_s, x_s):
+    def predicted_grads(phi, bn_s, x_s, y_s):
         """Predictor's gradient at the current state. First order (default): every ResNet quantity
         it reads is stop-gradient. --second-order: they stay differentiable in the adapted weights,
         so the outer gradient also counts how earlier updates change what the predictor reads
         (Hessian-vector products of the network; ResNet's own weights are still never trained)."""
         if args.second_order:
             p = {**sg_(params), **bn_s}
-            sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy)
+            sig = feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.test_loss(args.inner_loss, y_s))
         else:
             p = sg_({**params, **bn_s})
-            sig = sg_(feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy))
+            sig = sg_(feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.test_loss(args.inner_loss, y_s)))
         g_true = feedback.adapted_grads(args.adapt, p, sig, sig.deltas)
         if feedback.is_precond(phi):  # exact gradient, learned scale
             g = feedback.apply_precond(phi, g_true)
@@ -251,8 +255,8 @@ def main():
         logits, _ = resnet.apply({**params, **bn_s}, stats, imagenet.normalize(x), batch_stats=True)
         return jnp.mean(jax.nn.logsumexp(logits, -1) - jnp.take_along_axis(logits, y[:, None], -1)[:, 0]), logits
 
-    def one_update(phi, knobs, mult, bn_s, rule_s, x):
-        g, mis, logits = predicted_grads(phi, bn_s, x)
+    def one_update(phi, knobs, mult, bn_s, rule_s, x, y):
+        g, mis, logits = predicted_grads(phi, bn_s, x, y)
         bn_s, rule_s = timerule.apply(args.time_rule, knobs, rule_s, bn_s, g, bn0, args.lr, mult)
         return bn_s, rule_s, mis, logits
 
@@ -275,7 +279,7 @@ def main():
             def step(carry, batch):  # one update, then (--loss-on all) the label loss of the next batch
                 bn_s, vel_s = carry
                 x, y, x_next, y_next = batch
-                bn_s, vel_s, mis, logits = update_fn(phi, knobs, mult, bn_s, vel_s, x)
+                bn_s, vel_s, mis, logits = update_fn(phi, knobs, mult, bn_s, vel_s, x, y)
                 ce_t = ce_fn(bn_s, x_next, y_next)[0] if args.loss_on == "all" else 0.0
                 return (bn_s, vel_s), (mis, jnp.sum(logits.argmax(-1) == y), ce_t)
 
@@ -325,7 +329,7 @@ def main():
         mult = jnp.exp(log_mult) if args.time_rule == "momentum" else 1.0
 
         def one(bn_s, rule_s, x_s, y_s):
-            bn_s, rule_s, _, logits = one_update(phi, knobs, mult, bn_s, rule_s, x_s)
+            bn_s, rule_s, _, logits = one_update(phi, knobs, mult, bn_s, rule_s, x_s, y_s)
             return bn_s, rule_s, jnp.sum(logits.argmax(-1) == y_s)
         return jax.vmap(one, spmd_axis_name="streams")(bn, vel, x, y)
 
