@@ -509,7 +509,7 @@ def test_masked_batch_statistics_equal_the_subset_batch():
     if not os.path.exists(WEIGHTS):
         pytest.skip(f"weights not found: {WEIGHTS}")
     params, stats = resnet.load_torchvision(WEIGHTS)
-    x = jax.random.normal(jax.random.key(0), (6, 64, 64, 3))
+    x = jax.random.normal(jax.random.key(0), (6, 64, 64, 3), jnp.float32)
     m = jnp.array([True, False, True, True, False, True])
     full, _ = resnet.apply(params, stats, x, batch_stats=True, batch_mask=m)
     sub, _ = resnet.apply(params, stats, x[m], batch_stats=True)
