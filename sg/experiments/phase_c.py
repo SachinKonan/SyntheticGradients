@@ -75,13 +75,6 @@ def load_predictor(url, params_np, cache):
     return unflatten(template, dict(np.load(st.fetch_file(url, cache)))), meta
 
 
-def adapted_grads(adapt, p, sig, deltas):
-    """Gradients of the adapted parameters from error signals at the BNs."""
-    if adapt == "bn":
-        return resnet.bn_grads(deltas, sig.x_hats)
-    return feedback.conv1x1_grads(p, sig.x_hats, sig.inv_stds, sig.block_io, deltas)
-
-
 def flatten_grads(g, names):
     return jnp.concatenate([jnp.ravel(leaf) for n in names for leaf in jax.tree.leaves(g[n])])
 
@@ -95,7 +88,7 @@ def calibrate(params, stats, bn0, phi, train, sm, args):
         deltas = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
                                               sig.deltas, exact_top=args.exact_top,
                                               **feedback.predictor_kwargs(phi, sig.inv_stds))
-        g = adapted_grads(args.adapt, p, sig, deltas)
+        g = feedback.adapted_grads(args.adapt, p, sig, deltas)
         return jnp.stack([jnp.mean(jnp.square(flatten_grads(g, [n]))) for n in sorted(bn0)])
 
     x, _ = next(st.prefetch_batches(train, 1, args.decode_workers))
@@ -119,11 +112,15 @@ def main():
     ap.add_argument("--loss-on", default="last", choices=["last", "all"],
                     help="label loss on the batch after the K-th update, or the mean over all K batches")
     ap.add_argument("--remat", action="store_true", help="recompute steps in the outer backward (on for K >= 8)")
+    ap.add_argument("--remat-chunk", type=int, default=0,
+                    help="keep the carried state only every C steps of an unroll (K a multiple of C); "
+                         "for large adapted parameter sets")
     ap.add_argument("--unroll-schedule", default="", help="e.g. 1,2,4,8,16: K grows over the epochs")
     ap.add_argument("--fresh", action="store_true", help="every unroll starts from the original model")
     ap.add_argument("--time-rule", default="momentum", choices=["momentum", "filter"])
-    ap.add_argument("--adapt", default="bn", choices=["bn", "conv1x1"],
-                    help="what adapts: the BN affine params, or every 1x1 conv with BN frozen")
+    ap.add_argument("--adapt", default="bn", choices=["bn", "conv1x1", "conv"],
+                    help="what adapts: the BN affine params, or (BN frozen) every 1x1 conv, or every conv "
+                         "after the stem")
     ap.add_argument("--knob-lr", type=float, default=1e-2, help="Adam lr of the time-rule knobs")
     ap.add_argument("--freeze-predictor", action="store_true", help="train only the time rule (and step)")
     ap.add_argument("--switching-segment", type=int, default=0,
@@ -191,7 +188,9 @@ def main():
     params_np, stats_np = resnet.load_torchvision(st.fetch_file(args.weights, cache))
     params, stats = sm.replicate((params_np, stats_np))
     # The adapted parameters ("bn0" below): BN affine params, or every 1x1 conv with BN frozen.
-    adapted_names = resnet.bn_names() if args.adapt == "bn" else feedback.conv1x1_names()
+    adapted_names = feedback.adapted_names(args.adapt)
+    if args.adapt == "conv":  # every stream carries its own 3x3 kernels
+        resnet.einsum_convs(True)
     bn0 = {n: params[n] for n in adapted_names}
     phi0, meta = load_predictor(args.predictor, params_np, cache)
     log(f"{S} streams, predictor {meta.get('arch')} {meta.get('config')}, exact top {args.exact_top}, "
@@ -228,14 +227,14 @@ def main():
         """Predictor's BN gradient at the current state; every ResNet quantity is stop-gradient."""
         p = sg_({**params, **bn_s})
         sig = sg_(feedback.exact_signals(p, stats, imagenet.normalize(x_s), tent.entropy))
-        g_true = adapted_grads(args.adapt, p, sig, sig.deltas)
+        g_true = feedback.adapted_grads(args.adapt, p, sig, sig.deltas)
         if feedback.is_precond(phi):  # exact gradient, learned scale
             g = feedback.apply_precond(phi, g_true)
         else:
             deltas = feedback.backward_over_depth(p, stats, sig.x_hats, sig.block_io, sig.stem, sig.d_stream,
                                                   sig.deltas, exact_top=args.exact_top,
                                                   **feedback.predictor_kwargs(phi, sig.inv_stds))
-            g = adapted_grads(args.adapt, p, sig, deltas)
+            g = feedback.adapted_grads(args.adapt, p, sig, deltas)
         flat = lambda t: flatten_grads(t, adapted_names)
         return g, 1 - cosine(flat(g), flat(g_true)), sig.logits
 
@@ -271,16 +270,23 @@ def main():
                 ce_t = ce_fn(bn_s, x_next, y_next)[0] if args.loss_on == "all" else 0.0
                 return (bn_s, vel_s), (mis, jnp.sum(logits.argmax(-1) == y), ce_t)
 
-            # The first K-1 updates as a scan (one compiled step, whatever K), then the last one, whose
-            # next-batch loss counts under either --loss-on.
-            (bn_s, vel_s), (mis, correct, ce_t) = jax.lax.scan(
-                step, (bn_s, vel_s), (xs[:K - 1], ys[:K - 1], xs[1:K], ys[1:K]))
-            bn_s, vel_s, mis_last, logits = update_fn(phi, knobs, mult, bn_s, vel_s, xs[K - 1])
-            ce_last, logits_next = ce_fn(bn_s, xs[K], ys[K])
-            imit = (jnp.sum(mis) + mis_last) / K
-            correct = (jnp.sum(correct) + jnp.sum(logits.argmax(-1) == ys[K - 1])
-                       + jnp.sum(logits_next.argmax(-1) == ys[K]))
-            ce = (jnp.sum(ce_t) + ce_last) / K if args.loss_on == "all" else ce_last
+            # The K updates as a scan (one compiled step, whatever K). With --remat-chunk C the scan
+            # runs over chunks of C steps and keeps only each chunk's starting state for the outer
+            # backward (recomputing inside), so memory for the carried state is K/C + C copies, not K.
+            batches = (xs[:K], ys[:K], xs[1:], ys[1:])
+            C = args.remat_chunk
+            if C and K > C and K % C == 0:
+                chunked = jax.tree.map(lambda a: a.reshape((K // C, C) + a.shape[1:]), batches)
+                (bn_s, vel_s), outs = jax.lax.scan(
+                    jax.checkpoint(lambda carry, b: jax.lax.scan(step, carry, b)), (bn_s, vel_s), chunked)
+                outs = jax.tree.map(lambda a: a.reshape((K,) + a.shape[2:]), outs)
+            else:
+                (bn_s, vel_s), outs = jax.lax.scan(step, (bn_s, vel_s), batches)
+            mis, correct, ce_t = outs
+            ce_last, logits_next = ce_fn(bn_s, xs[K], ys[K])  # --loss-on last; and the last batch's score
+            imit = jnp.mean(mis)
+            correct = jnp.sum(correct) + jnp.sum(logits_next.argmax(-1) == ys[K])
+            ce = jnp.mean(ce_t) if args.loss_on == "all" else ce_last
             return ce + args.imitation * imit, (sg_(bn_s), sg_(vel_s), ce, imit, correct)
 
         @functools.partial(jax.jit, donate_argnums=(0, 1, 2), out_shardings=(sm.shard, sm.shard, sm.repl, sm.repl))

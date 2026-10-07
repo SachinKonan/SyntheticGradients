@@ -78,6 +78,26 @@ def pin(x):
     return x if _batch_sharding is None else jax.lax.with_sharding_constraint(x, _batch_sharding)
 
 
+_einsum_convs = False
+
+
+def einsum_convs(on: bool):
+    """Compute k x k convs as k^2 shifted einsums in code traced from now on: needed when every
+    stream carries its own k x k kernels (vmapped lax.conv kernels gave wrong sharded results)."""
+    global _einsum_convs
+    _einsum_convs = on
+
+
+def conv_taps(x, k, stride):
+    """taps[dy][dx]: the input pixels a k x k conv (zero padding (k-1)//2) multiplies by kernel
+    tap (dy, dx), one per output pixel."""
+    pad = (k - 1) // 2
+    xp = jnp.pad(x, ((0, 0), (pad, pad), (pad, pad), (0, 0))) if pad else x
+    h, w = (x.shape[1] + 2 * pad - k) // stride + 1, (x.shape[2] + 2 * pad - k) // stride + 1
+    return [[xp[:, dy:dy + stride * (h - 1) + 1:stride, dx:dx + stride * (w - 1) + 1:stride, :]
+             for dx in range(k)] for dy in range(k)]
+
+
 def conv(p, x, stride=1):
     k = p["w"].shape[0]
     if k == 1:
@@ -85,6 +105,10 @@ def conv(p, x, stride=1):
         # stream carries its own weights (vmapped lax.conv kernels gave wrong sharded results).
         x = x[:, ::stride, ::stride, :] if stride > 1 else x
         return pin(jnp.einsum("nhwc,cd->nhwd", x, p["w"][0, 0]))
+    if _einsum_convs:
+        taps = conv_taps(x, k, stride)
+        return pin(sum(jnp.einsum("nhwc,cd->nhwd", taps[dy][dx], p["w"][dy, dx])
+                       for dy in range(k) for dx in range(k)))
     pad = (k - 1) // 2
     return pin(jax.lax.conv_general_dilated(
         x, p["w"], (stride, stride), [(pad, pad), (pad, pad)],

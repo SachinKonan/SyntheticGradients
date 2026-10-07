@@ -444,3 +444,61 @@ def test_ram_cache_gives_the_same_batches():
     for (xa, ya), (xb, yb) in zip(st.prefetch_batches(jpeg_streams, 6, 4), st.prefetch_batches(ram_streams, 6, 4)):
         np.testing.assert_array_equal(xa, xb)
         np.testing.assert_array_equal(ya, yb)
+
+
+@pytest.mark.parametrize("k,stride", [(3, 1), (3, 2), (7, 2)])
+def test_einsum_conv_matches_lax_conv(k, stride):
+    key = jax.random.key(k + stride)
+    x = jax.random.normal(key, (2, 15, 15, 5))
+    w = jax.random.normal(jax.random.fold_in(key, 1), (k, k, 5, 4))
+    ref = resnet.conv({"w": w}, x, stride)
+    resnet.einsum_convs(True)
+    try:
+        out = resnet.conv({"w": w}, x, stride)
+    finally:
+        resnet.einsum_convs(False)
+    np.testing.assert_allclose(out, ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("einsum", [False, True])
+def test_conv_grads_match_backprop(signals, einsum):
+    """With exact deltas, the gradients of every conv after the stem (1x1 and 3x3) equal jax.grad."""
+    params, stats, *_ = signals
+    resnet.einsum_convs(einsum)
+    try:
+        with jax.enable_x64(True):
+            x = jax.random.normal(jax.random.key(0), (4, 64, 64, 3), jnp.float64)
+            sig = feedback.exact_signals(params, stats, x, tent.entropy)
+            names = feedback.conv_names()
+            ours = feedback.conv_grads(params, sig.x_hats, sig.inv_stds, sig.block_io, sig.deltas, names)
+            assert set(ours) == set(names) and len(names) == 52
+
+            def loss(convs):
+                logits, _ = resnet.apply({**params, **convs}, stats, x, batch_stats=True)
+                return tent.entropy(logits)
+
+            ref = jax.grad(loss)({n: params[n] for n in names})
+            for n in names:
+                np.testing.assert_allclose(ours[n]["w"], ref[n]["w"], rtol=1e-8,
+                                           atol=1e-12 * float(jnp.abs(ref[n]["w"]).max()), err_msg=n)
+    finally:
+        resnet.einsum_convs(False)
+
+
+def test_per_stream_3x3_kernels_shard_correctly_as_einsums():
+    """Per-stream 3x3 kernels sharded over devices match the single-device result with einsum convs."""
+    if len(jax.devices()) < 2:
+        pytest.skip("needs 2 devices")
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    key = jax.random.key(0)
+    w = jax.random.normal(key, (2, 3, 3, 16, 8))
+    x = jax.random.normal(jax.random.fold_in(key, 1), (2, 4, 9, 9, 16))
+    resnet.einsum_convs(True)
+    try:
+        f = jax.jit(jax.vmap(lambda w, x: resnet.conv({"w": w}, x, stride=2)))
+        ref = f(w, x)
+        sh = NamedSharding(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("s",)), P("s"))
+        out = f(jax.device_put(w, sh), jax.device_put(x, sh))
+    finally:
+        resnet.einsum_convs(False)
+    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)

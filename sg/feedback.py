@@ -425,28 +425,56 @@ def conv1x1_names() -> list[str]:
     return names
 
 
-def conv1x1_grads(params, x_hats, inv_stds, block_io, deltas, names=None):
-    """Weight gradients of 1x1 convs from the error signals at the BNs that follow them.
+def conv_names() -> list[str]:
+    """Every conv after the stem: the 1x1 convs and each block's 3x3 conv2 (the 7x7 stem conv,
+    9K weights, is left out: its input image is not kept)."""
+    return conv1x1_names() + [f"{pre}.conv2" for pre, _, _ in resnet.blocks()]
 
-    A 1x1 conv z = x @ W feeds a batch-statistics BN; the error at z is that BN's
-    exact backward of its output error (cheap), and dL/dW = sum over pixels of x^T dz.
-    Inputs: conv1 reads the block input, conv3 reads relu(bn2), the projection
-    reads the (strided) block input. Exact deltas give the exact gradient.
+
+def conv_grads(params, x_hats, inv_stds, block_io, deltas, names):
+    """Weight gradients of convs from the error signals at the BNs that follow them.
+
+    A conv z = conv(x, W) feeds a batch-statistics BN; the error at z is that BN's exact
+    backward of its output error (cheap), and dL/dW[tap] = sum over pixels of x_tap^T dz.
+    Inputs: conv1 reads the block input, conv2 (3x3) reads relu(bn1), conv3 reads relu(bn2),
+    the projection reads the (strided) block input. Exact deltas give the exact gradient.
     """
-    names = set(names or conv1x1_names())
+    names = set(names)
+    act = lambda bn: jnp.maximum(params[bn]["scale"] * x_hats[bn] + params[bn]["bias"], 0.0)
     out = {}
     for k, (pre, stride, projection) in enumerate(resnet.blocks()):
         h_in = block_io[k][0]
-        sources = {f"{pre}.conv1": (h_in, f"{pre}.bn1"),
-                   f"{pre}.conv3": (jnp.maximum(params[f"{pre}.bn2"]["scale"] * x_hats[f"{pre}.bn2"]
-                                                + params[f"{pre}.bn2"]["bias"], 0.0), f"{pre}.bn3")}
+        sources = {f"{pre}.conv1": (h_in, f"{pre}.bn1", 1),
+                   f"{pre}.conv2": (act(f"{pre}.bn1"), f"{pre}.bn2", stride),
+                   f"{pre}.conv3": (act(f"{pre}.bn2"), f"{pre}.bn3", 1)}
         if projection:
-            sources[f"{pre}.downsample.0"] = (h_in[:, ::stride, ::stride, :], f"{pre}.downsample.1")
-        for conv, (x_in, bn_name) in sources.items():
-            if conv in names:
-                dz = _bn_backward(params, x_hats, inv_stds, bn_name, deltas[bn_name])
-                out[conv] = {"w": jnp.einsum("nhwc,nhwd->cd", x_in, dz)[None, None]}
+            sources[f"{pre}.downsample.0"] = (h_in, f"{pre}.downsample.1", stride)
+        for conv, (x_in, bn_name, s) in sources.items():
+            if conv not in names:
+                continue
+            dz = _bn_backward(params, x_hats, inv_stds, bn_name, deltas[bn_name])
+            size = params[conv]["w"].shape[0]
+            taps = resnet.conv_taps(x_in, size, s) if size > 1 else [[x_in[:, ::s, ::s, :]]]
+            out[conv] = {"w": jnp.stack([jnp.stack([jnp.einsum("nhwc,nhwd->cd", t, dz) for t in row])
+                                         for row in taps])}
     return out
+
+
+def conv1x1_grads(params, x_hats, inv_stds, block_io, deltas, names=None):
+    """conv_grads of the 1x1 convs."""
+    return conv_grads(params, x_hats, inv_stds, block_io, deltas, names or conv1x1_names())
+
+
+def adapted_names(adapt: str) -> list[str]:
+    """What --adapt updates: the 53 BN (scale, bias), the 1x1 convs, or every conv after the stem."""
+    return {"bn": resnet.bn_names(), "conv1x1": conv1x1_names(), "conv": conv_names()}[adapt]
+
+
+def adapted_grads(adapt, params, sig, deltas):
+    """Gradients of what --adapt updates, from error signals at the BNs."""
+    if adapt == "bn":
+        return resnet.bn_grads(deltas, sig.x_hats)
+    return conv_grads(params, sig.x_hats, sig.inv_stds, sig.block_io, deltas, adapted_names(adapt))
 
 
 # ----------------------------------------------------------------------------- DFA
