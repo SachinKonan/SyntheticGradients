@@ -561,3 +561,19 @@ def test_second_order_meta_gradient_matches_finite_differences(signals):
         first = dot(jax.grad(meta_loss)(phi, False))
         np.testing.assert_allclose(second, fd, rtol=1e-4)
         assert abs(first - second) > 1e-3 * abs(second)
+
+
+def test_filter_without_anchor_is_adam():
+    """--no-anchor: the filter is bias-corrected Adam (with the relative floor), no pull-back."""
+    from sg import timerule
+    names = resnet.bn_names()[:1]
+    bn = {n: {"scale": jnp.ones(3), "bias": jnp.zeros(3)} for n in names}
+    knobs = {n: v for n, v in timerule.init_knobs("filter", eta={n: 0.1 for n in resnet.bn_names()},
+                                                   anchor=None).items() if n in names}
+    assert "log_anchor" not in knobs[names[0]]
+    g = {n: {"scale": jnp.array([1.0, -2.0, 0.5]), "bias": jnp.array([0.1, 0.1, 0.1])} for n in names}
+    far = {n: {"scale": 10 * jnp.ones(3), "bias": 10 * jnp.ones(3)} for n in names}  # source far away
+    new, _ = timerule.apply("filter", knobs, timerule.init_state("filter", bn), bn, g, far, lr=0.0, mult=1.0)
+    gs = np.array([1.0, -2.0, 0.5])
+    np.testing.assert_allclose(new[names[0]]["scale"],
+                               1 - 0.1 * gs / (np.abs(gs) + timerule.REL_EPS * np.sqrt(np.mean(gs ** 2))), rtol=1e-5)

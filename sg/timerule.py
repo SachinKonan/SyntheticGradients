@@ -9,7 +9,8 @@
                                                    small when they flip (noise)
               w    <- w - anchor * (w - w_source)  pull back toward the source model
             with bias-corrected averages and e = 1% of the layer's typical sqrt(sq). Per BN layer it has four learned knobs:
-            eta (step), b1 and b2 (memory lengths), anchor (pull-back strength).
+            eta (step), b1 and b2 (memory lengths), anchor (pull-back strength; optional,
+            without it the rule is Adam).
 
 Everything is a pure function of (knobs, state, w, g, w_source), so the knobs can
 be trained through the adaptation trajectory like the predictor (phase_c).
@@ -30,13 +31,15 @@ REL_EPS = 1e-2
 
 def init_knobs(kind, eta=None, b1=0.9, b2=0.99, anchor=1e-4, names=None):
     """eta: {layer: initial step} (e.g. from calibrate_eta); scalars per adapted layer
-    (the 53 BNs by default, or e.g. the 1x1 convs)."""
+    (the 53 BNs by default, or e.g. the 1x1 convs). anchor=None: no pull-back (plain Adam)."""
     if kind == "momentum":
         return {}
     logit = lambda p: float(np.log(p / (1 - p)))
-    return {n: {"log_eta": np.float32(np.log(eta[n])), "logit_b1": np.float32(logit(b1)),
-                "logit_b2": np.float32(logit(b2)), "log_anchor": np.float32(np.log(anchor))}
-            for n in (names or resnet.bn_names())}
+    knob = lambda n: {"log_eta": np.float32(np.log(eta[n])), "logit_b1": np.float32(logit(b1)),
+                      "logit_b2": np.float32(logit(b2))}
+    if anchor is None:
+        return {n: knob(n) for n in (names or resnet.bn_names())}
+    return {n: {**knob(n), "log_anchor": np.float32(np.log(anchor))} for n in (names or resnet.bn_names())}
 
 
 def calibrate_eta(grads, lr):
@@ -64,7 +67,8 @@ def apply(kind, knobs, state, bn, g, bn_source, lr, mult):
     for n in bn:
         k = knobs[n]
         b1, b2 = jax.nn.sigmoid(k["logit_b1"]), jax.nn.sigmoid(k["logit_b2"])
-        eta, anchor = jnp.exp(k["log_eta"]) * mult, jnp.exp(k["log_anchor"])
+        eta = jnp.exp(k["log_eta"]) * mult
+        anchor = jnp.exp(k["log_anchor"]) if "log_anchor" in k else 0.0  # no pull-back: Adam
         avg[n] = jax.tree.map(lambda a, gg: b1 * a + (1 - b1) * gg, state["avg"][n], g[n])
         sq[n] = jax.tree.map(lambda s, gg: b2 * s + (1 - b2) * gg * gg, state["sq"][n], g[n])
         # sqrt has an infinite derivative at 0 (exactly-zero gradients), so keep it off zero.

@@ -140,6 +140,7 @@ def main():
                          "values of the adapted weights, updated by exact backprop at every step")
     ap.add_argument("--second-order", action="store_true",
                     help="exact meta-gradient (MAML): do not stop-gradient what the predictor reads from ResNet")
+    ap.add_argument("--no-anchor", action="store_true", help="filter without the pull-back toward the source (Adam)")
     ap.add_argument("--freeze-eta", action="store_true",
                     help="filter: keep each layer's step at its calibrated start; learn only b1, b2, anchor")
     ap.add_argument("--seed", type=int, default=0, help="training stream order (0 reproduces earlier runs)")
@@ -217,6 +218,7 @@ def main():
     knobs0 = timerule.init_knobs("momentum")
     if args.time_rule == "filter":  # initial steps matched to momentum SGD at the starting multiplier
         knobs0 = timerule.init_knobs("filter", eta=calibrate(params, stats, bn0, phi0, train, sm, args),
+                                     anchor=None if args.no_anchor else 1e-4,
                                      names=adapted_names)
     state = {"phi": phi0, "log_mult": np.float32(np.log(args.init_mult)),
              "opt_phi": {"t": np.zeros((), np.int32), "m": zeros_like(phi0), "v": zeros_like(phi0)},
@@ -430,7 +432,8 @@ def main():
         mult = float(np.exp(host["log_mult"]))
         st.write_output(args.out, "predictor.json", json.dumps(
             {**meta, "kind": "predictor", "phase_c": vars(args), "learned_mult": mult,
-             "time_rule": args.time_rule, "adapt": args.adapt, "source_predictor": args.predictor}).encode())
+             "time_rule": args.time_rule, "anchor": not args.no_anchor, "adapt": args.adapt,
+             "source_predictor": args.predictor}).encode())
         st.write_output(args.out, "results.json", json.dumps({"config": vars(args), "history": history,
                                                               "learned_mult": mult}).encode())
         log(f"done; learned step x{mult:.3f}")

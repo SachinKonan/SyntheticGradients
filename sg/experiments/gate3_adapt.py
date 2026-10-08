@@ -199,7 +199,8 @@ def main():
         recs[name] = sm.replicate(unflatten(template, load_npz(url, cache)))
         kind = meta.get("time_rule", "momentum")
         if kind != "momentum":  # learned time rule saved next to the predictor
-            knob_template = timerule.init_knobs(kind, eta={n: 1.0 for n in adapted_names}, names=adapted_names)
+            knob_template = timerule.init_knobs(kind, eta={n: 1.0 for n in adapted_names}, names=adapted_names,
+                                                anchor=1e-4 if meta.get("anchor", True) else None)
             rules[name] = (kind, sm.replicate(unflatten(knob_template, load_npz(
                 url.removesuffix("predictor.npz") + "time_rule.npz", cache))))
         log(f"predictor {name}: {arch} {meta.get('config')}, time rule {kind}")
