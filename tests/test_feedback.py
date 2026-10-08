@@ -577,3 +577,25 @@ def test_filter_without_anchor_is_adam():
     gs = np.array([1.0, -2.0, 0.5])
     np.testing.assert_allclose(new[names[0]]["scale"],
                                1 - 0.1 * gs / (np.abs(gs) + timerule.REL_EPS * np.sqrt(np.mean(gs ** 2))), rtol=1e-5)
+
+
+def test_normmom_moves_each_layer_by_its_learned_fraction():
+    """normmom: the first step moves every layer by exactly rho * |w| (no pull-back), any gradient scale;
+    the pull-back variant is sigmoid-bounded and moves toward the source."""
+    from sg import timerule
+    names = resnet.bn_names()[:2]
+    bn = {n: {"scale": jnp.ones(4) * (i + 1), "bias": jnp.full(4, 0.5)} for i, n in enumerate(names)}
+    g = {n: {"scale": jnp.array([1e-6, -3e-6, 2e-6, 0.0]) * (i + 1) * 10 ** i, "bias": jnp.ones(4) * 1e-6}
+         for i, n in enumerate(names)}
+    knobs = timerule.init_knobs("normmom", names=names, anchor=None)
+    new, _ = timerule.apply("normmom", knobs, timerule.init_state("normmom", bn), bn, g, bn, lr=0.0, mult=1.0)
+    size = lambda t: np.sqrt(sum(float(jnp.sum(jnp.square(a))) for a in jax.tree.leaves(t)))
+    for n in names:
+        moved = size(jax.tree.map(jnp.subtract, new[n], bn[n])) / size(bn[n])
+        np.testing.assert_allclose(moved, 2e-4, rtol=1e-4)
+    knobs = timerule.init_knobs("normmom", names=names, anchor=0.5)
+    far = {n: jax.tree.map(lambda a: a + 1.0, bn[n]) for n in names}
+    zero = jax.tree.map(jnp.zeros_like, g)
+    new, _ = timerule.apply("normmom", knobs, timerule.init_state("normmom", bn), bn, zero, far, lr=0.0, mult=1.0)
+    for n in names:  # zero gradient: only the pull-back acts, halfway to the source
+        np.testing.assert_allclose(new[n]["scale"], bn[n]["scale"] + 0.5, rtol=1e-5)

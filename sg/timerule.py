@@ -12,6 +12,14 @@
             eta (step), b1 and b2 (memory lengths), anchor (pull-back strength; optional,
             without it the rule is Adam).
 
+  normmom   momentum with a learned, bounded per-layer step relative to the layer's size:
+              v  <- 0.9 v + g
+              w  <- w - rho_max * sigmoid(z) * |w| * v / |v|    (norms over the layer)
+              w  <- w - pull * (w - w_source)                     (optional; pull = sigmoid(p))
+            so each layer moves a learned fraction (at most rho_max = 1%) of its own size per
+            batch, in the direction of the (momentum-averaged) predicted gradient. Tent's default
+            moves layers by ~2e-4 of their size per batch, the starting point here.
+
 Everything is a pure function of (knobs, state, w, g, w_source), so the knobs can
 be trained through the adaptation trajectory like the predictor (phase_c).
 """
@@ -23,18 +31,25 @@ import numpy as np
 from sg.models import resnet
 
 MOMENTUM = 0.9
+RHO_MAX = 1e-2  # normmom: at most 1% of a layer's size per batch
 EPS = 1e-12
 # The step avg / sqrt(sq) is sign(g) on the first batch, whose slope is unbounded where g ~ 0;
 # phase_c differentiates through it, so the floor is relative to the layer's gradient size.
 REL_EPS = 1e-2
 
 
-def init_knobs(kind, eta=None, b1=0.9, b2=0.99, anchor=1e-4, names=None):
+def init_knobs(kind, eta=None, b1=0.9, b2=0.99, anchor=1e-4, names=None, rho=2e-4):
     """eta: {layer: initial step} (e.g. from calibrate_eta); scalars per adapted layer
-    (the 53 BNs by default, or e.g. the 1x1 convs). anchor=None: no pull-back (plain Adam)."""
+    (the 53 BNs by default, or e.g. the 1x1 convs). anchor=None: no pull-back (plain Adam).
+    normmom: rho is the starting step as a fraction of each layer's size (Tent's default ~2e-4)."""
     if kind == "momentum":
         return {}
     logit = lambda p: float(np.log(p / (1 - p)))
+    if kind == "normmom":
+        knob = {"logit_rho": np.float32(logit(rho / RHO_MAX))}
+        if anchor is not None:
+            knob["logit_pull"] = np.float32(logit(anchor))
+        return {n: dict(knob) for n in (names or resnet.bn_names())}
     knob = lambda n: {"log_eta": np.float32(np.log(eta[n])), "logit_b1": np.float32(logit(b1)),
                       "logit_b2": np.float32(logit(b2))}
     if anchor is None:
@@ -51,7 +66,7 @@ def calibrate_eta(grads, lr):
 
 def init_state(kind, bn):
     zeros = jax.tree.map(jnp.zeros_like, bn)
-    if kind == "momentum":
+    if kind in ("momentum", "normmom"):
         return {"vel": zeros}
     return {"avg": zeros, "sq": zeros, "t": jnp.zeros(())}
 
@@ -61,6 +76,17 @@ def apply(kind, knobs, state, bn, g, bn_source, lr, mult):
     if kind == "momentum":
         vel = jax.tree.map(lambda v, gg: MOMENTUM * v + gg, state["vel"], g)
         return jax.tree.map(lambda b, v: b - lr * mult * v, bn, vel), {"vel": vel}
+
+    if kind == "normmom":
+        vel = jax.tree.map(lambda v, gg: MOMENTUM * v + gg, state["vel"], g)
+        layer_norm = lambda t: jnp.sqrt(sum(jnp.sum(jnp.square(a)) for a in jax.tree.leaves(t)) + EPS ** 2)
+        new_bn = {}
+        for n in bn:
+            k = knobs[n]
+            move = RHO_MAX * jax.nn.sigmoid(k["logit_rho"]) * mult * layer_norm(bn[n]) / layer_norm(vel[n])
+            pull = jax.nn.sigmoid(k["logit_pull"]) if "logit_pull" in k else 0.0
+            new_bn[n] = jax.tree.map(lambda w, v, w0: w - move * v - pull * (w - w0), bn[n], vel[n], bn_source[n])
+        return new_bn, {"vel": vel}
 
     t = state["t"] + 1
     new_bn, avg, sq = {}, {}, {}

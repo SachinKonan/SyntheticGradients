@@ -118,7 +118,7 @@ def main():
                          "for large adapted parameter sets")
     ap.add_argument("--unroll-schedule", default="", help="e.g. 1,2,4,8,16: K grows over the epochs")
     ap.add_argument("--fresh", action="store_true", help="every unroll starts from the original model")
-    ap.add_argument("--time-rule", default="momentum", choices=["momentum", "filter"])
+    ap.add_argument("--time-rule", default="momentum", choices=["momentum", "filter", "normmom"])
     ap.add_argument("--adapt", default="bn", choices=["bn", "conv1x1", "conv"],
                     help="what adapts: the BN affine params, or (BN frozen) every 1x1 conv, or every conv "
                          "after the stem")
@@ -216,6 +216,8 @@ def main():
 
     zeros_like = lambda t: jax.tree.map(np.zeros_like, t)
     knobs0 = timerule.init_knobs("momentum")
+    if args.time_rule == "normmom":  # each layer starts at Tent's default relative step
+        knobs0 = timerule.init_knobs("normmom", names=adapted_names, anchor=None if args.no_anchor else 1e-4)
     if args.time_rule == "filter":  # initial steps matched to momentum SGD at the starting multiplier
         knobs0 = timerule.init_knobs("filter", eta=calibrate(params, stats, bn0, phi0, train, sm, args),
                                      anchor=None if args.no_anchor else 1e-4,
