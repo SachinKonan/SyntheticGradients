@@ -126,6 +126,12 @@ def main():
     ap.add_argument("--freeze-predictor", action="store_true", help="train only the time rule (and step)")
     ap.add_argument("--switching-segment", type=int, default=0,
                     help="training streams switch corruption/severity every N batches (0: one per stream)")
+    ap.add_argument("--segment-range", default="",
+                    help="lo,hi: training streams switch fit group after L batches, L log-uniform in [lo, hi] "
+                         "and redrawn per stretch (overrides --switching-segment)")
+    ap.add_argument("--save-at", default="", help="also save the predictor after these update counts (e.g. 512,768)")
+    ap.add_argument("--epoch-batches", type=int, default=None,
+                    help="batches per stream per epoch (reset at each epoch start); default one pass of a group")
     ap.add_argument("--meta-lr", type=float, default=3e-5)
     ap.add_argument("--step-lr", type=float, default=1e-2, help="Adam lr of the log step multiplier")
     ap.add_argument("--imitation", type=float, default=0.1)
@@ -175,7 +181,8 @@ def main():
 
     train = [stream(specs[s], fit_ids) for s in sm.local_ids]
     groups = sorted({g for g, _ in all_specs})
-    if args.switching_segment:
+    switching = bool(args.switching_segment or args.segment_range)
+    if switching:
         loaded = {g: stream((g, 0), fit_ids) for g in groups}
 
         def switching_streams(epoch):
@@ -189,10 +196,31 @@ def main():
                     segs.append(base.view(np.random.default_rng([epoch, spec_id, j]).permutation(len(base.records))))
                 out.append(st.ConcatStream(segs, args.switching_segment))
             return out
+
+        def random_length_streams(epoch, num_steps):
+            """Each stream: fit groups in random order (a fresh permutation each cycle), each for L
+            batches with L log-uniform in --segment-range (redrawn per stretch, capped at the group's
+            length), no reset in between, until num_steps batches are covered."""
+            lo, hi = (float(v) for v in args.segment_range.split(","))
+            out = []
+            for spec_id in sm.local_ids:
+                rng = np.random.default_rng([epoch, spec_id, 23] + ([args.seed] if args.seed else []))
+                segs, lengths, j = [], [], 0
+                while sum(lengths) < num_steps:
+                    for gi in rng.permutation(len(groups)):
+                        base = loaded[groups[gi]]
+                        view = base.view(np.random.default_rng([epoch, spec_id, j, 23]).permutation(len(base.records)))
+                        segs.append(view)
+                        lengths.append(min(view.num_steps, int(round(np.exp(rng.uniform(np.log(lo), np.log(hi)))))))
+                        j += 1
+                        if sum(lengths) >= num_steps:
+                            break
+                out.append(st.SegmentStream(segs, lengths))
+            return out
     val = [stream(specs[s], test_ids) for s in sm.local_ids]
     if args.ram_cache:
         t = time.time()
-        st.decode_in_ram((list(loaded.values()) if args.switching_segment else train) + val,
+        st.decode_in_ram((list(loaded.values()) if switching else train) + val,
                          max(args.decode_workers, 2 * (os.cpu_count() or 1) // 3))
         log(f"decoded into RAM in {time.time() - t:.0f}s")
     params_np, stats_np = resnet.load_torchvision(st.fetch_file(args.weights, cache))
@@ -212,7 +240,8 @@ def main():
         f"K={k_schedule}, loss on {args.loss_on}, {'fresh' if args.fresh else 'carried'} start, "
         f"meta-lr {args.meta_lr}, imitation {args.imitation}, start step x{args.init_mult}, "
         f"time rule {args.time_rule}{' (predictor frozen)' if args.freeze_predictor else ''}, "
-        f"switching every {args.switching_segment or 'never'}")
+        f"switching {('every ' + str(args.switching_segment)) if not args.segment_range else 'after log-uniform ' + args.segment_range} batches"
+        f"{'' if switching else ' (never)'}")
 
     zeros_like = lambda t: jax.tree.map(np.zeros_like, t)
     knobs0 = timerule.init_knobs("momentum")
@@ -371,9 +400,31 @@ def main():
             st.write_output(args.out, "ckpt/meta.json", json.dumps(
                 {"epochs_done": epochs_done, "updates_done": updates_done, "history": history}).encode())
 
+    def save_predictor(prefix):
+        """The predictor (and time rule, and for MAML the starting weights) under args.out/prefix."""
+        host = jax.device_get(state)
+        if not lead:
+            return
+        buf = io.BytesIO()
+        np.savez(buf, **flatten(host["phi"]))
+        st.write_output(args.out, prefix + "predictor.npz", buf.getvalue())
+        if args.time_rule != "momentum":
+            buf = io.BytesIO()
+            np.savez(buf, **flatten(host["knobs"]))
+            st.write_output(args.out, prefix + "time_rule.npz", buf.getvalue())
+        if args.learner == "init":  # the learned starting weights, for gate3_adapt --weights
+            buf = io.BytesIO()
+            resnet.save_npz(buf, {**params_np, **host["phi"]}, stats_np)
+            st.write_output(args.out, prefix + "weights.npz", buf.getvalue())
+        st.write_output(args.out, prefix + "predictor.json", json.dumps(
+            {**meta, "kind": "predictor", "phase_c": vars(args), "learned_mult": float(np.exp(host["log_mult"])),
+             "time_rule": args.time_rule, "anchor": not args.no_anchor, "adapt": args.adapt,
+             "source_predictor": args.predictor, "updates_done": updates_done}).encode())
+
+    save_at = {int(v) for v in args.save_at.split(",") if v}
     # Training carries the adapted weights (gpn) or their offset from the learned start (init).
     start0 = jax.tree.map(jnp.zeros_like, bn0) if args.learner == "init" else bn0
-    steps_per_epoch = st.common_steps(train)
+    steps_per_epoch = args.epoch_batches or st.common_steps(train)
     if args.steps:
         steps_per_epoch = min(steps_per_epoch, args.steps)
     if start_epoch == 0:
@@ -387,7 +438,10 @@ def main():
         for s, spec_id in zip(train, sm.local_ids):
             key = [epoch, specs[spec_id][1], spec_id] + ([args.seed] if args.seed else [])
             s.perm = np.random.default_rng(key).permutation(len(s.records))
-        epoch_streams = switching_streams(epoch) if args.switching_segment else train
+        if args.segment_range:
+            epoch_streams = random_length_streams(epoch, steps_per_epoch)
+        else:
+            epoch_streams = switching_streams(epoch) if args.switching_segment else train
         K = k_for_epoch(epoch)
         if K not in outer_steps:
             outer_steps[K] = make_outer_step(K)
@@ -409,6 +463,9 @@ def main():
             x_prev, y_prev = window[-1]  # the scored batch is the next unroll's first batch
             n += 1
             updates_done += 1
+            if updates_done in save_at:  # snapshot for evaluation at this compute
+                save_predictor(f"at{updates_done}/")
+                log(f"saved snapshot at {updates_done} updates")
             if i % 20 == 0 or i + 1 == outer_per_epoch:
                 info = jax.device_get(info)
                 err = 100 * (1 - info["correct"] / (S * (K + 1) * args.batch))
@@ -418,28 +475,12 @@ def main():
         evaluate(f"epoch {epoch + 1}")
         checkpoint(epoch + 1)
 
+    save_predictor("")
     if lead:
-        host = jax.device_get(state)
-        buf = io.BytesIO()
-        np.savez(buf, **flatten(host["phi"]))
-        st.write_output(args.out, "predictor.npz", buf.getvalue())
-        if args.time_rule != "momentum":
-            buf = io.BytesIO()
-            np.savez(buf, **flatten(host["knobs"]))
-            st.write_output(args.out, "time_rule.npz", buf.getvalue())
-        if args.learner == "init":  # the learned starting weights, for gate3_adapt --weights
-            buf = io.BytesIO()
-            resnet.save_npz(buf, {**params_np, **host["phi"]}, stats_np)
-            st.write_output(args.out, "weights.npz", buf.getvalue())
-        mult = float(np.exp(host["log_mult"]))
-        st.write_output(args.out, "predictor.json", json.dumps(
-            {**meta, "kind": "predictor", "phase_c": vars(args), "learned_mult": mult,
-             "time_rule": args.time_rule, "anchor": not args.no_anchor, "adapt": args.adapt,
-             "source_predictor": args.predictor}).encode())
+        mult = float(np.exp(jax.device_get(state["log_mult"])))
         st.write_output(args.out, "results.json", json.dumps({"config": vars(args), "history": history,
                                                               "learned_mult": mult}).encode())
         log(f"done; learned step x{mult:.3f}")
-
 
 if __name__ == "__main__":
     main()

@@ -599,3 +599,21 @@ def test_normmom_moves_each_layer_by_its_learned_fraction():
     new, _ = timerule.apply("normmom", knobs, timerule.init_state("normmom", bn), bn, zero, far, lr=0.0, mult=1.0)
     for n in names:  # zero gradient: only the pull-back acts, halfway to the source
         np.testing.assert_allclose(new[n]["scale"], bn[n]["scale"] + 0.5, rtol=1e-5)
+
+
+def test_segment_stream_serves_each_segment_in_turn():
+    """SegmentStream: segment j supplies its own batches 0..L_j-1, back to back."""
+    from sg.experiments import streams as st
+
+    class Fake:
+        decoded, resize = True, False
+
+        def __init__(self, tag, n):
+            self.tag, self.num_steps = tag, n
+
+        def batch_arrays(self, i):
+            return np.full((1,), self.tag), np.array([i])
+
+    s = st.SegmentStream([Fake(0, 5), Fake(1, 5), Fake(2, 5)], [2, 3, 1])
+    got = [tuple(int(a[0]) for a in s.batch_arrays(k)) for k in range(s.num_steps)]
+    assert got == [(0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (2, 0)] and s.decoded

@@ -229,6 +229,34 @@ def read_output(out: str, name: str) -> bytes | None:
     return path.read_bytes() if path.exists() else None
 
 
+class SegmentStream:
+    """Segments of different lengths back to back, no reset between them: segment j supplies
+    batches 0 .. lengths[j]-1 of its own Stream (views share records and decoded images)."""
+
+    def __init__(self, segments, lengths):
+        assert all(n <= s.num_steps for s, n in zip(segments, lengths))
+        self.segments, self.lengths = segments, list(lengths)
+        self.starts = np.concatenate([[0], np.cumsum(self.lengths)[:-1]])
+        self.num_steps = int(sum(self.lengths))
+        self.resize = segments[0].resize
+
+    def _at(self, step):
+        j = int(np.searchsorted(self.starts, step, side="right")) - 1
+        return self.segments[j], step - int(self.starts[j])
+
+    def batch_records(self, step):
+        seg, i = self._at(step)
+        return seg.batch_records(i)
+
+    def batch_arrays(self, step):
+        seg, i = self._at(step)
+        return seg.batch_arrays(i)
+
+    @property
+    def decoded(self):
+        return all(s.decoded for s in self.segments)
+
+
 class ConcatStream:
     """Several streams back to back, `steps_each` batches from each, no reset between them
     (continual adaptation). Segment i uses its own Stream's order."""
