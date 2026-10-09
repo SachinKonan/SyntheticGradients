@@ -2,7 +2,8 @@
 
 Follows the authors' code (mariodoebler/test-time-adaptation: methods/roid.py,
 cfgs/imagenet_c/roid.yaml, conf.py defaults), ResNet-50 on ImageNet-C:
-  - only the BN (scale, bias) adapt, BN with test-batch statistics;
+  - only the BN (scale, bias) adapt, BN with test-batch statistics (--adapt conv1x1 / conv adapts
+    those convs instead, BN frozen, for comparisons on the same weights);
   - SGD, lr 2.5e-4, momentum 0.9, Nesterov, batch 64, one step per batch;
   - loss: soft likelihood ratio, weighted per example by exp(diversity x certainty / (1/3)),
     where diversity = 1 - cos(running mean prediction, prediction) and certainty = -entropy
@@ -32,6 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from sg import feedback
 from sg.augment import tta_augment
 from sg.data import imagenet
 from sg.experiments import streams as st
@@ -59,6 +61,8 @@ def main():
     ap.add_argument("--momentum-src", type=float, default=0.99, help="weight ensembling with the source")
     ap.add_argument("--momentum-probs", type=float, default=0.9, help="EMA of the mean prediction")
     ap.add_argument("--temperature", type=float, default=1 / 3)
+    ap.add_argument("--adapt", default="bn", choices=["bn", "conv1x1", "conv"],
+                    help="what adapts: BN (as published), or with BN frozen the 1x1 convs / every conv")
     args = ap.parse_args()
 
     st.init_distributed(args)
@@ -69,9 +73,13 @@ def main():
     S = len(specs)
     mults = np.array([float(m) for m in args.mults.split(",")], np.float32)
     traj_shard = NamedSharding(sm.shard.mesh, P(None, "streams"))  # (multipliers, streams, ...)
-    log(f"ROID on set {args.set}: {S} streams, lr {args.lr} x {mults.tolist()}")
+    log(f"ROID ({args.adapt}) on set {args.set}: {S} streams, lr {args.lr} x {mults.tolist()}")
     params, stats = sm.replicate(resnet.load_torchvision(st.fetch_file(args.weights, cache)))
-    bn0 = {n: params[n] for n in resnet.bn_names()}
+    # What adapts: the BN (scale, bias) as published, or (BN frozen) the 1x1 convs / every conv,
+    # to compare with methods that adapt those. The rest of the method is unchanged.
+    bn0 = {n: params[n] for n in feedback.adapted_names(args.adapt)}
+    if args.adapt == "conv":  # every stream carries its own 3x3 kernels
+        resnet.einsum_convs(True)
     num_steps = st.common_steps(streams)
     if args.steps:
         num_steps = min(num_steps, args.steps)
