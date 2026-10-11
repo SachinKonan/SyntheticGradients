@@ -1,0 +1,32 @@
+# One job on a tpuswarm v5p-32 pool worker (4 hosts, 16 chips, us-east5-a).
+# Submit with TPU=v5p32 tpu/submit.sh, which fills CODE_URL, MODULE, ARGS. SG_BUCKET keeps every
+# GCS read and write in the us-east5 copy (sg/experiments/streams.py).
+name: synthgrad
+resources:
+  cloud: gcp
+  region: us-east5
+  zone: us-east5-a
+  accelerators: tpu-v5p-32
+  accelerator_args:
+    gcp_queued_resource: true
+    runtime_version: v2-alpha-tpuv5
+  use_spot: true
+  disk_size: 150
+  job_recovery:
+    strategy: FAILOVER
+    max_restarts_on_errors: 0
+envs:
+  CODE_URL: ""
+  MODULE: ""
+  ARGS: ""
+  SG_BUCKET: gs://sk7524-tinker-tpu-us-east5/synthgrad
+run: |
+  set -euo pipefail
+  code="$HOME/synthgrad/code/$(basename "$CODE_URL" .tar.gz)"
+  if [ ! -d "$code" ]; then
+    mkdir -p "$code.tmp"
+    gcloud storage cp "$CODE_URL" "$code.tar.gz"
+    tar -xzf "$code.tar.gz" -C "$code.tmp"
+    mv "$code.tmp" "$code"
+  fi
+  exec bash "$code/tpu/run.sh" "$MODULE" $ARGS

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Submit a module to the v4-64 pool (or, with TPU=v6e8, the us-east5 v6e-8 pool) at the current commit.
-# Usage: [TPU=v6e8] bash tpu/submit.sh <job name> <python module> [module args...]
+# Submit a module to the v4-64 pool (or, with TPU=v6e8 / v5p32, a us-east5 pool) at the current commit.
+# Usage: [TPU=v6e8|v5p32] bash tpu/submit.sh <job name> <python module> [module args...]
 # The code bundle is `git archive HEAD`, so the tree must be clean and pushed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 case ${TPU:-v4-64} in
   v4-64) POOL=tpuswarm-v4-64-central2-qwen35-erdos; BUCKET=gs://sk7524-tinker-tpu-us-central2/synthgrad; YAML=tpu/v4-64.yaml ;;
   v6e8) POOL=tpuswarm-v6e8-east5b; BUCKET=gs://sk7524-tinker-tpu-us-east5/synthgrad; YAML=tpu/v6e-8.yaml ;;
+  v5p32) POOL=tpuswarm-v5p32-east5a-erdos; BUCKET=gs://sk7524-tinker-tpu-us-east5/synthgrad; YAML=tpu/v5p-32.yaml ;;
   *) echo "unknown TPU=$TPU" >&2; exit 1 ;;
 esac
 export CLOUDSDK_CONFIG=/home/sk7524/.config/gcloud-tpuswarm-compute-sa-v6e32
