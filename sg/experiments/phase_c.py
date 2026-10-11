@@ -105,7 +105,7 @@ def cosine(a, b):
 def main():
     ap = argparse.ArgumentParser()
     st.add_launch_args(ap)
-    ap.add_argument("--predictor", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/lr4.npz",
+    ap.add_argument("--predictor", default=f"{st.BUCKET}/predictors/lr4.npz",
                     help="saved predictor .npz (with .json), or svd:<frac> to start without pretraining")
     ap.add_argument("--exact-top", type=int, default=1, help="exact top blocks, at training and deployment")
     ap.add_argument("--init-mult", type=float, default=3.0, help="starting step multiplier (from deployment tuning)")

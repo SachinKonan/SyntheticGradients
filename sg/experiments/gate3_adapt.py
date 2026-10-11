@@ -157,10 +157,10 @@ def main():
     ap.add_argument("--lr", type=float, default=2.5e-4, help="Tent's step size; scaled by each multiplier")
     ap.add_argument("--momentum", type=float, default=0.9)
     ap.add_argument("--mults", default="0.3,1,3,10,30,100")
-    ap.add_argument("--predictors", default="A=gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k0best.npz,"
-                                            "B=gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k1best.npz",
+    ap.add_argument("--predictors", default=f"A={st.BUCKET}/predictors/rec_k0best.npz,"
+                                            f"B={st.BUCKET}/predictors/rec_k1best.npz",
                     help="name=url,...; 'none' for no trained predictors")
-    ap.add_argument("--dfa", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/dfa_fit.npz")
+    ap.add_argument("--dfa", default=f"{st.BUCKET}/predictors/dfa_fit.npz")
     ap.add_argument("--rank", type=int, default=64)
     ap.add_argument("--methods", default="tent,shortcut@0,shortcut@1,shortcut@2,shortcut@4,dfa,"
                                          "A@0,B@0,B@1,B@2,B@4")

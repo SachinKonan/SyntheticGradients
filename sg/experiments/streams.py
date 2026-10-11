@@ -20,10 +20,21 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from sg.data import imagenet
 from sg.data.records import decode
 
+# This region's copy of our GCS data. A job outside us-central2 sets SG_BUCKET to its own
+# region's copy, and then every gs:// read and write must stay inside it (cross-region
+# traffic is expensive).
+BUCKET = os.environ.get("SG_BUCKET", "gs://sk7524-tinker-tpu-us-central2/synthgrad")
+
+
+def same_region(url: str) -> str:
+    if "SG_BUCKET" in os.environ and url.startswith("gs://") and not url.startswith(BUCKET + "/"):
+        raise ValueError(f"{url} is outside this region's bucket {BUCKET}")
+    return url
+
 
 def fetch(root: str, rel: str, cache: Path) -> Path:
     """Local path of root/rel. A gs:// root is copied into the cache once."""
-    if not root.startswith("gs://"):
+    if not same_region(root).startswith("gs://"):
         return Path(root, rel)
     dst = cache / rel
     if not (dst / ".complete").exists():
@@ -35,7 +46,7 @@ def fetch(root: str, rel: str, cache: Path) -> Path:
 
 def fetch_file(url: str, cache: Path) -> str:
     """Local copy of a gs:// file, cached by its full path (different runs reuse file names)."""
-    if not url.startswith("gs://"):
+    if not same_region(url).startswith("gs://"):
         return url
     cache.mkdir(parents=True, exist_ok=True)
     local = cache / "files" / url.removeprefix("gs://")
@@ -187,8 +198,8 @@ def common_steps(streams) -> int:
 
 
 def add_launch_args(p):
-    p.add_argument("--data-root", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/data/imagenet_v1")
-    p.add_argument("--weights", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/weights/resnet50_tv_in1k.safetensors")
+    p.add_argument("--data-root", default=f"{BUCKET}/data/imagenet_v1")
+    p.add_argument("--weights", default=f"{BUCKET}/weights/resnet50_tv_in1k.safetensors")
     p.add_argument("--local-cache", default=os.path.expanduser("~/synthgrad/cache"))
     p.add_argument("--out", required=True, help="results dir (local or gs://)")
     p.add_argument("--precision", default="highest", choices=["default", "high", "highest"])
@@ -208,7 +219,7 @@ def init_distributed(args):
 
 def write_output(out: str, name: str, data: bytes):
     """Write a file to a local dir or a gs:// prefix."""
-    if out.startswith("gs://"):
+    if same_region(out).startswith("gs://"):
         local = Path("/tmp/synthgrad-out") / name
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(data)
@@ -220,7 +231,7 @@ def write_output(out: str, name: str, data: bytes):
 
 def read_output(out: str, name: str) -> bytes | None:
     """Read a file written by write_output, or None if it does not exist."""
-    if out.startswith("gs://"):
+    if same_region(out).startswith("gs://"):
         local = Path("/tmp/synthgrad-in") / name
         local.parent.mkdir(parents=True, exist_ok=True)
         r = subprocess.run(["gcloud", "storage", "cp", f"{out}/{name}", str(local)], capture_output=True)

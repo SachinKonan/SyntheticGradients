@@ -617,3 +617,15 @@ def test_segment_stream_serves_each_segment_in_turn():
     s = st.SegmentStream([Fake(0, 5), Fake(1, 5), Fake(2, 5)], [2, 3, 1])
     got = [tuple(int(a[0]) for a in s.batch_arrays(k)) for k in range(s.num_steps)]
     assert got == [(0, 0), (0, 1), (1, 0), (1, 1), (1, 2), (2, 0)] and s.decoded
+
+
+def test_same_region_rejects_other_buckets(monkeypatch):
+    from sg.experiments import streams as st
+    st.same_region("gs://anywhere/x")  # no SG_BUCKET: everything allowed
+    monkeypatch.setenv("SG_BUCKET", "gs://east/synthgrad")
+    monkeypatch.setattr(st, "BUCKET", "gs://east/synthgrad")
+    assert st.same_region("gs://east/synthgrad/data") == "gs://east/synthgrad/data"
+    assert st.same_region("/local/path") == "/local/path"
+    for bad in ("gs://central/synthgrad/data", "gs://east/synthgrad-other/x"):
+        with pytest.raises(ValueError):
+            st.same_region(bad)

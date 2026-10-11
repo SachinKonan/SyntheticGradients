@@ -39,7 +39,7 @@ def main():
     ap.add_argument("--momentum", type=float, default=0.9, help="Tent")
     ap.add_argument("--fracs", default="0.03125,0.0625,0.125,0.25,0.5")
     ap.add_argument("--exact-tops", default="0,1")
-    ap.add_argument("--rec", default="gs://sk7524-tinker-tpu-us-central2/synthgrad/predictors/rec_k1best.npz")
+    ap.add_argument("--rec", default=f"{st.BUCKET}/predictors/rec_k1best.npz")
     ap.add_argument("--rank", type=int, default=64, help="rank of --rec")
     ap.add_argument("--eval-steps", type=int, default=50)
     ap.add_argument("--streams", type=int, default=None, help="first N streams (smoke tests)")
